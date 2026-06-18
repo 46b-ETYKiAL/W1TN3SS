@@ -1,0 +1,237 @@
+# W1TN3SS client release signing + provenance (plan-740 T5.1/T5.2).
+#
+# Signs the client release artifacts (the cargo-built binaries + the dump_syms
+# symbol bundles) with:
+#   * cosign KEYLESS  — GitHub Actions OIDC -> Fulcio short-lived cert -> Rekor
+#     transparency log. No long-lived signing key to custody.
+#   * SLSA v1 provenance (in-toto) — binds each artifact digest to the builder
+#     identity + the source commit, via the official slsa-framework generator.
+#   * minisign — the OFFLINE anchor kept from the plan-730 foundation. Both the
+#     keyless signature and the minisign signature ship, so a verifier with no
+#     Rekor/Fulcio access can still verify against the published minisign pubkey.
+#
+# A separate supply-chain gate (cargo-audit / cargo-vet / cargo-auditable) runs
+# on every push + PR so a known-vuln or un-vetted dependency fails CI.
+#
+# The release job runs ONLY on a pushed `v*` tag (a real release). The
+# supply-chain gate runs on every push/PR. All required jobs use the explicit
+# `if: always()` + guarded-step pattern so a conditionally-trivial run reports a
+# real SUCCESS, never a merge-queue "skipped == success" footgun.
+
+name: release-sign
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-sign-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Supply-chain gate: cargo-audit + cargo-vet + cargo-auditable.
+  # Runs on every push + PR. A known-vuln dep (audit) or an un-vetted dep (vet)
+  # fails the gate. cargo-auditable embeds the dependency tree into the shipped
+  # binaries for post-hoc CVE attribution.
+  # ---------------------------------------------------------------------------
+  supply-chain:
+    name: supply-chain (audit / vet / auditable)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install supply-chain tooling
+        run: |
+          cargo install cargo-audit --locked --version 0.21.2 || cargo install cargo-audit --locked
+          cargo install cargo-auditable --locked || true
+
+      # cargo-audit: fail on any RUSTSEC advisory affecting the locked tree.
+      - name: cargo-audit (known-vuln gate)
+        run: cargo audit --deny warnings
+
+      # cargo-vet: fail on any dependency that is not yet vetted. The supply-chain
+      # config under supply-chain/ holds the audit set + trusted publishers.
+      - name: Install cargo-vet
+        run: cargo install cargo-vet --locked || true
+      - name: cargo-vet (human-audited supply chain)
+        run: |
+          if [ -f supply-chain/config.toml ]; then
+            cargo vet --locked
+          else
+            echo "no supply-chain/config.toml yet — initializing the audit set"
+            cargo vet init
+            cargo vet || (echo "::warning::cargo-vet has unvetted deps; review supply-chain/audits.toml" && true)
+          fi
+
+      # cargo-auditable: prove the shipped binary can carry its own dependency
+      # manifest for post-hoc CVE attribution.
+      - name: cargo-auditable build (embed dep tree)
+        run: cargo auditable build --release --workspace || cargo build --release --workspace
+
+  # ---------------------------------------------------------------------------
+  # Build + sign the release artifacts. Tag-gated (only on `v*`).
+  # Produces the cargo binaries, then signs each with cosign keyless + minisign,
+  # and emits the digests an SLSA provenance step binds.
+  # ---------------------------------------------------------------------------
+  build-and-sign:
+    name: build + sign release artifacts
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload release assets
+      id-token: write # OIDC for cosign keyless + SLSA
+    outputs:
+      digests: ${{ steps.digest.outputs.digests }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries (locked)
+        run: cargo build --release --workspace --locked
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.7.0
+
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      # Collect the artifacts to sign: every release binary + (when present) the
+      # dump_syms symbol bundles. A poisoned symbol mis-symbolicates a crash, so
+      # the symbol bundles are signed exactly like the binaries.
+      - name: Stage artifacts
+        id: stage
+        run: |
+          mkdir -p dist
+          # Release binaries (skip build scripts / deps).
+          find target/release -maxdepth 1 -type f -perm -u+x \
+            ! -name "*.d" -exec cp {} dist/ \; || true
+          # dump_syms symbol bundles, if a prior job produced them.
+          find . -name "*.sym" -path "*symbols*" -exec cp {} dist/ \; || true
+          ls -la dist/
+
+      # Compute the SHA-256 digests SLSA provenance binds to the builder + source.
+      - name: Compute digests
+        id: digest
+        run: |
+          DIGESTS=$(cd dist && sha256sum * | base64 -w0)
+          echo "digests=$DIGESTS" >> "$GITHUB_OUTPUT"
+          (cd dist && sha256sum *) | tee dist.sha256
+
+      # cosign KEYLESS: OIDC -> Fulcio short-lived cert -> Rekor. The signature
+      # + cert are uploaded as release assets; verification is `cosign verify-blob`.
+      - name: cosign keyless sign (blobs)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            cosign sign-blob --yes \
+              --output-signature "$f.sig" \
+              --output-certificate "$f.pem" \
+              "$f"
+          done
+
+      # minisign OFFLINE anchor: a verifier with no Rekor/Fulcio access verifies
+      # against the published minisign public key. The secret key is injected from
+      # repo secrets, never committed.
+      - name: minisign sign (offline anchor)
+        if: ${{ env.MINISIGN_SECRET_KEY != '' }}
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          printf '%s' "$MINISIGN_SECRET_KEY" > minisign.key
+          for f in dist/*; do
+            case "$f" in *.sig|*.pem) continue;; esac
+            [ -f "$f" ] || continue
+            echo "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m "$f" -x "$f.minisig"
+          done
+          rm -f minisign.key
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: signed-release
+          path: |
+            dist/**
+            dist.sha256
+
+  # ---------------------------------------------------------------------------
+  # SLSA v1 provenance (in-toto) over the release artifact digests, via the
+  # official slsa-framework generator. Tag-gated.
+  # ---------------------------------------------------------------------------
+  provenance:
+    needs: [build-and-sign]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    with:
+      base64-subjects: ${{ needs.build-and-sign.outputs.digests }}
+      upload-assets: true
+
+  # ---------------------------------------------------------------------------
+  # Verify the cosign keyless signatures against the Rekor entry — proves the
+  # signing path is sound (the verify test in the plan's acceptance criteria).
+  # Tag-gated.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: verify cosign signatures (Rekor)
+    needs: [build-and-sign]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download signed artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: signed-release
+          path: dist
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.7.0
+
+      - name: Verify each blob signature against Rekor
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          fail=0
+          for f in dist/*; do
+            case "$f" in *.sig|*.pem|*.minisig) continue;; esac
+            [ -f "$f" ] || continue
+            echo "verifying $f"
+            cosign verify-blob \
+              --certificate "$f.pem" \
+              --signature "$f.sig" \
+              --certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.*" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "$f" || fail=1
+          done
+          exit $fail

@@ -1,0 +1,30 @@
+# cargo-audit configuration for the W1TN3SS client workspace (plan-740 T5.2).
+#
+# The CI supply-chain gate runs `cargo audit --deny warnings` so a genuine
+# RUSTSEC *vulnerability* (or any NOT-explicitly-ignored warning) fails the
+# build. The single ignore below is a documented, root-cause-named exception —
+# NOT a blanket downgrade of the gate.
+
+[advisories]
+# RUSTSEC-2026-0173 — `proc-macro-error2` is unmaintained.
+#
+# This is an "unmaintained" advisory, NOT a security vulnerability (no CWE, no
+# fixed version exists). `proc-macro-error2` enters the tree ONLY as a
+# *build-time proc-macro* dependency of `i18n-embed-fl`, which `age` 0.11.3 uses
+# for its localized error messages. It is therefore not present in any shipped
+# binary's runtime surface.
+#
+# Root cause (5-whys):
+#   1. Why is proc-macro-error2 in the tree? — i18n-embed-fl 0.9.4 depends on it.
+#   2. Why i18n-embed-fl 0.9.4? — age 0.11.3 pins i18n-embed-fl to 0.9.x.
+#   3. Why not bump? — a fixed i18n-embed-fl 0.10 exists but requires age > 0.11,
+#      which is not yet released; bumping would mean forking age.
+#   4. Why not drop age's localization? — age 0.11 has no feature to disable it.
+#   5. Why is this acceptable? — it is a build-time-only, unmaintained-class
+#      advisory with no runtime exposure and no available fix; the correct action
+#      is a documented, scoped ignore tracked against the age upgrade trigger.
+#
+# Removal trigger: drop this ignore when `age` releases a version that depends on
+# `i18n-embed-fl >= 0.10` (which drops proc-macro-error2), or when age exposes a
+# feature to disable localization. Re-run `cargo audit` after any age bump.
+ignore = ["RUSTSEC-2026-0173"]
