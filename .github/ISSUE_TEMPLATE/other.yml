@@ -1,0 +1,30 @@
+name: Question or other
+description: Ask a question or report anything that is not a bug or a feature request.
+title: "other: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for questions, feedback, or anything that does not fit the bug
+        or feature templates. You are filling this in yourself — nothing is sent
+        automatically, and you can edit anything before you submit. Please avoid
+        including anything private.
+  - type: input
+    id: app_version
+    attributes:
+      label: App version
+      description: The version of the app you are using (optional).
+      placeholder: "0.0.0"
+    validations:
+      required: false
+  - type: textarea
+    id: body
+    attributes:
+      label: Details
+      description: >-
+        Describe your question or issue. If the in-app "Report an issue" dialog
+        prefilled this for you, review and edit it before submitting.
+    validations:
+      required: true

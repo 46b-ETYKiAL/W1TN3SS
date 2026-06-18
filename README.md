@@ -38,4 +38,20 @@ itasha-report-core = { git = "https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-W1
 
 Apache-2.0. The self-hosted server is private (`Itasha.Corp_S4F3-W1TN3SS-S3RV3R`).
 
+## Shared issue templates
+
+[`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE) holds the fleet's shared
+GitHub Issue-Form templates — `bug.yml`, `feature.yml`, and `other.yml`, plus a
+`config.yml` chooser. Each form declares a server-side `labels:` key, so the
+right label (`bug` / `enhancement` / `question`) is applied on submission
+**regardless of the submitter's permissions** — a drive-by reporter does not
+need write access for the label to stick.
+
+A fleet app's in-app "Report an issue" dialog deep-links into these forms via
+`itasha-report-core`'s intake helpers: it builds a prefilled
+`…/issues/new?template=bug.yml&title=…&body=…&labels=…` URL, opens it in the
+user's browser, and falls back to copying the body to the clipboard when the URL
+would exceed the safe length ceiling (`GITHUB_URL_LENGTH_THRESHOLD`). The forms
+are equally usable on their own — every fleet repo can reuse this set unchanged.
+
 <p align="center"><img src=".github/footer.svg" alt="" width="100%"></p>

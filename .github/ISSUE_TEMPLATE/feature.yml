@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest an idea or improvement for an Itasha fleet app.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. You are filling this in yourself —
+        nothing is sent automatically, and you can edit anything before you
+        submit. Please avoid including anything private.
+  - type: input
+    id: app_version
+    attributes:
+      label: App version
+      description: The version of the app you are using (optional but helpful).
+      placeholder: "0.0.0"
+    validations:
+      required: false
+  - type: textarea
+    id: body
+    attributes:
+      label: What would you like to see?
+      description: >-
+        Describe the problem you are trying to solve and the change you would
+        like. If the in-app "Report an issue" dialog prefilled this for you,
+        review and edit it before submitting.
+      placeholder: |
+        Problem / motivation:
+
+        Proposed solution:
+
+        Alternatives considered:
+    validations:
+      required: true

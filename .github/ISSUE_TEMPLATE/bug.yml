@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a problem or unexpected behavior in an Itasha fleet app.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Nothing here is sent
+        automatically — you are filling this in yourself, and you can edit or
+        remove anything before you submit. Please do **not** include passwords,
+        tokens, file contents, or anything you would rather keep private.
+  - type: input
+    id: app_version
+    attributes:
+      label: App version
+      description: The version of the app (e.g. shown in Settings or the title bar).
+      placeholder: "0.0.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: renderer
+    attributes:
+      label: Renderer / environment
+      description: Optional — GPU/renderer backend or any environment detail the app reports.
+      placeholder: "wgpu / software / unknown"
+    validations:
+      required: false
+  - type: textarea
+    id: body
+    attributes:
+      label: What happened?
+      description: >-
+        Describe the problem, the steps to reproduce it, what you expected, and
+        what actually happened. If the in-app "Report an issue" dialog prefilled
+        this for you, review and edit it before submitting.
+      placeholder: |
+        Steps to reproduce:
+        1.
+        2.
+
+        Expected:
+
+        Actual:
+    validations:
+      required: true
