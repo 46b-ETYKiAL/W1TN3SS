@@ -22,9 +22,14 @@
 //! 2. **Heightened consent** — [`Tier2ConsentToken`] is a SEPARATE, more
 //!    sensitive consent type than Tier-1 text, minted only after the user
 //!    accepts an explicit disclosure ([`TIER2_CONSENT_DISCLOSURE`]).
-//! 3. **Minimized-memory capture** — [`MinidumpPolicy::Minimized`] writes
-//!    stacks + registers and drops heap / private memory where the platform
-//!    flag surface allows.
+//! 3. **Minimized-memory capture, ENFORCED on every platform** —
+//!    [`MinidumpPolicy::Minimized`] sets the Windows `MinidumpType` flags, and
+//!    [`scrub::scrub_minidump_in_place`] then minimizes the WRITTEN dump bytes
+//!    on every platform before they are spooled: it drops the environment
+//!    block, command line, full-memory/heap, memory-map, and handle-name
+//!    streams (which the live `minidumper` writer emits and offers no flag to
+//!    suppress on Linux/macOS) and coarsens the module list. The raw pre-scrub
+//!    dump is deleted in-handler — only the scrubbed bytes ever reach disk.
 //! 4. **Local-spool-only, NEVER auto-send** — the monitor writes minidumps to
 //!    the local `itasha-report-core` spool; this crate has NO network code at
 //!    all. The host transmits the Sentry envelope only after Tier-2 consent.
@@ -65,12 +70,14 @@ pub mod consent;
 pub mod emit;
 pub mod monitor;
 pub mod policy;
+pub mod scrub;
 
 pub use client::{arm_capture, ArmError, ArmedCapture, CaptureConfig};
 pub use consent::{Tier2ConsentToken, TIER2_CONSENT_DISCLOSURE};
 pub use emit::{build_crash_report, build_envelope, spool_minidump};
 pub use monitor::{run_monitor, CaptureOutcome, MonitorHandler, DEFAULT_SOCKET_NAME};
 pub use policy::MinidumpPolicy;
+pub use scrub::{scrub_minidump_in_place, ScrubError, ScrubReport};
 
 /// The crate / SDK name.
 pub const CRATE_NAME: &str = "itasha-crash-capture";
