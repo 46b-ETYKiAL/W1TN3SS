@@ -216,6 +216,123 @@ fn tier2_consent_gates_envelope_emission_with_ephemeral_id() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 4. STACK-ONLY MINIMIZATION ENFORCED ON EVERY PLATFORM (gap D-4)
+// ---------------------------------------------------------------------------
+
+/// The cross-platform byte-level minimizer MUST drop the environment block,
+/// command line, full-memory/heap, memory-map, and handle streams — the
+/// identifying reservoirs the per-OS writer emits but offers no flag to
+/// suppress. This locks the enforcement so a future change to the drop-set
+/// breaks a test rather than silently shrinking the privacy posture.
+#[test]
+fn minimizer_drops_every_identifying_stream_on_every_platform() {
+    use itasha_crash_capture::scrub::is_identifying_stream;
+    // The exact identifying-stream constants (from minidump_common's
+    // MINIDUMP_STREAM_TYPE), asserted by their numeric discriminant so this test
+    // does not need the minidump-writer enum in scope.
+    let must_drop: &[(u32, &str)] = &[
+        (0x4767_0007, "LinuxEnviron (/proc/$pid/environ)"),
+        (0x4767_0006, "LinuxCmdLine (/proc/$pid/cmdline)"),
+        (0x4767_0004, "LinuxProcStatus (uid/gid)"),
+        (0x4767_0009, "LinuxMaps (memory-map paths)"),
+        (0x4767_0008, "LinuxAuxv"),
+        (0x4d7a_0003, "MozLinuxLimits"),
+        (9, "Memory64ListStream (heap/full memory)"),
+        (16, "MemoryInfoListStream (region fingerprint)"),
+        (12, "HandleDataStream (handle/document names)"),
+        (10, "CommentStreamA"),
+        (11, "CommentStreamW"),
+    ];
+    for (ty, name) in must_drop {
+        assert!(
+            is_identifying_stream(*ty),
+            "{name} (0x{ty:08x}) MUST be dropped to enforce stack-only capture"
+        );
+    }
+    // The symbolication keep-set is NOT dropped.
+    for (ty, name) in &[
+        (3u32, "ThreadListStream"),
+        (5, "MemoryListStream (thread stacks)"),
+        (4, "ModuleListStream (coarsened, not dropped)"),
+        (6, "ExceptionStream"),
+        (7, "SystemInfoStream"),
+    ] {
+        assert!(
+            !is_identifying_stream(*ty),
+            "{name} (0x{ty:08x}) MUST be kept — it is needed to symbolicate"
+        );
+    }
+}
+
+/// End-to-end privacy invariant: feeding a synthetic minidump bearing an env
+/// block with a username + secret through the public minimizer must zero the
+/// PII bytes while preserving the thread-stack memory — proving the minimizer
+/// is the ENFORCED, all-platform stack-only gate, not a per-OS writer flag.
+#[test]
+fn minimizer_zeroes_env_pii_but_keeps_stack_memory() {
+    use itasha_crash_capture::scrub::scrub_minidump_in_place;
+
+    // Build a minimal 2-stream minidump: [header][dir][env][stack].
+    const SIG: u32 = 0x504d_444d;
+    let env = b"USER=jane\0HOME=/home/jane\0AWS_SECRET=AKIAhunter2\0";
+    let stack = b"STACK-keepme-for-the-backtrace";
+    let mut buf = vec![0u8; 32 + 2 * 12];
+    buf[0..4].copy_from_slice(&SIG.to_le_bytes());
+    buf[8..12].copy_from_slice(&2u32.to_le_bytes());
+    buf[12..16].copy_from_slice(&32u32.to_le_bytes());
+    let env_rva = buf.len();
+    buf.extend_from_slice(env);
+    let stack_rva = buf.len();
+    buf.extend_from_slice(stack);
+    // dir[0] = LinuxEnviron
+    buf[32..36].copy_from_slice(&0x4767_0007u32.to_le_bytes());
+    buf[36..40].copy_from_slice(&(env.len() as u32).to_le_bytes());
+    buf[40..44].copy_from_slice(&(env_rva as u32).to_le_bytes());
+    // dir[1] = MemoryListStream (the thread stacks)
+    buf[44..48].copy_from_slice(&5u32.to_le_bytes());
+    buf[48..52].copy_from_slice(&(stack.len() as u32).to_le_bytes());
+    buf[52..56].copy_from_slice(&(stack_rva as u32).to_le_bytes());
+
+    let report = scrub_minidump_in_place(&mut buf).expect("scrub a valid minidump");
+    assert_eq!(report.streams_dropped, 1, "the env stream must be dropped");
+
+    let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+    assert!(!contains(&buf, b"jane"), "env username must be zeroed");
+    assert!(!contains(&buf, b"AKIAhunter2"), "env secret must be zeroed");
+    assert!(
+        contains(&buf, b"STACK-keepme-for-the-backtrace"),
+        "thread-stack memory (the backtrace) must be preserved"
+    );
+}
+
+/// The in-handler "delete the raw `.dmp`, spool only the scrubbed bytes" contract
+/// is the privacy-critical sequence. Assert it at the source level so a future
+/// refactor that re-introduces a durable raw-dump write breaks a test.
+#[test]
+fn monitor_deletes_raw_dump_and_spools_only_scrubbed_bytes() {
+    let monitor_src = crates_dir()
+        .join("itasha-crash-capture")
+        .join("src")
+        .join("monitor.rs");
+    let src = std::fs::read_to_string(&monitor_src)
+        .unwrap_or_else(|e| panic!("read {}: {e}", monitor_src.display()));
+    // The handler minimizes before spooling and deletes the raw dump.
+    assert!(
+        src.contains("scrub_minidump_in_place"),
+        "the monitor MUST minimize the written dump before spooling"
+    );
+    assert!(
+        src.contains("remove_file(raw_path)"),
+        "the monitor MUST delete the raw .dmp in-handler"
+    );
+    // Fail-closed: an un-minimizable dump is not spooled.
+    assert!(
+        src.contains("fail-closed, not spooled"),
+        "the monitor MUST fail-closed (never spool) when minimization fails"
+    );
+}
+
 /// Extract the `[dependencies]` table body from a Cargo manifest as a string,
 /// stopping at the next top-level `[` table header. Used to scope the
 /// never-auto-send dependency scan to production deps only.

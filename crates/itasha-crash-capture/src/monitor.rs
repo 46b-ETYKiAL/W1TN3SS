@@ -15,12 +15,21 @@
 //! The minidump is written by `minidumper`'s server using the bundled
 //! `minidump-writer`, which on every platform captures **stack traces for all
 //! threads — not the full heap** (the `Normal` minidump baseline). The monitor
-//! then reads the written dump and spools it LOCALLY via
-//! `itasha-report-core`'s budgeted spool. It transmits NOTHING. The
-//! [`crate::policy::MinidumpPolicy`] minimized contract — including the
-//! stronger `FilterMemory` / `WithoutOptionalData` reductions — is the policy
-//! this monitor asserts and is applied at the direct-write path
-//! ([`crate::policy::write_minidump`]).
+//! then reads the written dump, **minimizes it across ALL platforms** via
+//! [`crate::scrub::scrub_minidump_in_place`] (dropping the env block, command
+//! line, full-memory/heap, memory-map, and handle streams the per-OS writer
+//! emits but offers no flag to suppress; coarsening the module list), **deletes
+//! the raw pre-scrub `.dmp` immediately**, and spools ONLY the scrubbed bytes
+//! LOCALLY via `itasha-report-core`'s budgeted spool. It transmits NOTHING.
+//!
+//! The [`crate::policy::MinidumpPolicy`] minimized contract drives the Windows
+//! `MinidumpType` flag set; the byte-level scrub is the CROSS-PLATFORM
+//! enforcement that closes the Linux/macOS "documented intent only" gap — the
+//! live `minidumper` server invokes the per-OS writer with its DEFAULT config
+//! (`None` `MinidumpType` on Windows; no `sanitize_stack` / no env-cmdline
+//! suppression on Linux), so the written bytes are the only place stack-only
+//! can actually be ENFORCED. Scrub failure is fail-closed: a dump that cannot
+//! be parsed-and-minimized is deleted and NOT spooled.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,10 +47,15 @@ pub const DEFAULT_SOCKET_NAME: &str = "w1tn3ss-crash-monitor";
 /// Counts/enums only — NEVER minidump bytes, NEVER PII.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureOutcome {
-    /// A minidump was written to disk at `path` and spooled.
+    /// A minidump was written, MINIMIZED (env/cmdline/heap/maps streams dropped,
+    /// module list coarsened), the raw pre-scrub dump deleted, and the scrubbed
+    /// bytes spooled.
     MinidumpWritten {
         /// The spooled report path.
         path: PathBuf,
+        /// Counts-only report of what the cross-platform scrub removed. Proves
+        /// the stack-only minimization gate actually ran.
+        scrub: crate::scrub::ScrubReport,
     },
     /// Capture was attempted but the OS minidump write failed.
     CaptureFailed {
@@ -99,6 +113,69 @@ impl MonitorHandler {
         let mut guard = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
         guard.push(outcome);
     }
+
+    /// The privacy-critical in-handler sequence: read the raw dump, MINIMIZE the
+    /// bytes (cross-platform stack-only enforcement), DELETE the raw `.dmp`
+    /// immediately, then spool ONLY the scrubbed bytes locally.
+    ///
+    /// Fail-closed at every step: if the dump cannot be read, scrubbed, or
+    /// spooled, the raw `.dmp` is deleted and NOTHING is persisted — a dump
+    /// whose env/cmdline/heap could not be proven-removed must never reach the
+    /// spool. We never transmit; we only persist to the budgeted local spool.
+    fn minimize_delete_and_spool(&self, raw_path: &std::path::Path) {
+        // 1. Read the raw written dump.
+        let mut bytes = match std::fs::read(raw_path) {
+            Ok(b) => b,
+            Err(e) => {
+                // Best-effort delete even on read failure (it may be partially
+                // written and still PII-bearing).
+                let _ = std::fs::remove_file(raw_path);
+                self.record(CaptureOutcome::CaptureFailed {
+                    reason: format!("read dump failed: {e}"),
+                });
+                return;
+            }
+        };
+
+        // 2. Minimize the bytes IN PLACE (drop env/cmdline/heap/maps streams,
+        //    coarsen the module list). Fail-closed on a parse error.
+        let scrub = match crate::scrub::scrub_minidump_in_place(&mut bytes) {
+            Ok(report) => report,
+            Err(e) => {
+                // The raw dump is deleted; the un-minimizable bytes are dropped
+                // (zeroed in memory) and never spooled.
+                bytes.iter_mut().for_each(|b| *b = 0);
+                let _ = std::fs::remove_file(raw_path);
+                self.record(CaptureOutcome::CaptureFailed {
+                    reason: format!("scrub failed (fail-closed, not spooled): {e}"),
+                });
+                return;
+            }
+        };
+
+        // 3. DELETE the raw pre-scrub dump immediately — it is the only copy of
+        //    the un-minimized bytes and must never persist to a durable path.
+        if let Err(e) = std::fs::remove_file(raw_path) {
+            // If we cannot delete the raw dump, do NOT spool — leaving both the
+            // raw (PII-bearing) dump and a spooled copy is worse than failing.
+            bytes.iter_mut().for_each(|b| *b = 0);
+            self.record(CaptureOutcome::CaptureFailed {
+                reason: format!("raw dump delete failed (fail-closed, not spooled): {e}"),
+            });
+            return;
+        }
+
+        // 4. Spool ONLY the scrubbed bytes to the budgeted local spool.
+        match crate::emit::spool_minidump(&self.config_dir, bytes, &[]) {
+            Ok(spooled) => self.record(CaptureOutcome::MinidumpWritten {
+                path: spooled,
+                scrub,
+            }),
+            Err(e) => self.record(CaptureOutcome::CaptureFailed {
+                reason: format!("spool failed: {e}"),
+            }),
+        }
+    }
 }
 
 impl ServerHandler for MonitorHandler {
@@ -115,26 +192,7 @@ impl ServerHandler for MonitorHandler {
 
     fn on_minidump_created(&self, result: Result<MinidumpBinary, minidumper::Error>) -> LoopAction {
         match result {
-            Ok(md) => {
-                // Read the written minidump back and spool it locally. We never
-                // transmit — only persist to the budgeted local spool.
-                match std::fs::read(&md.path) {
-                    Ok(bytes) => match crate::emit::spool_minidump(&self.config_dir, bytes, &[]) {
-                        Ok(spooled) => {
-                            // Best-effort cleanup of the temp dump; the canonical
-                            // copy now lives in the spool.
-                            let _ = std::fs::remove_file(&md.path);
-                            self.record(CaptureOutcome::MinidumpWritten { path: spooled });
-                        }
-                        Err(e) => self.record(CaptureOutcome::CaptureFailed {
-                            reason: format!("spool failed: {e}"),
-                        }),
-                    },
-                    Err(e) => self.record(CaptureOutcome::CaptureFailed {
-                        reason: format!("read dump failed: {e}"),
-                    }),
-                }
-            }
+            Ok(md) => self.minimize_delete_and_spool(&md.path),
             Err(e) => self.record(CaptureOutcome::CaptureFailed {
                 reason: format!("minidump write failed: {e}"),
             }),
@@ -197,33 +255,136 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Build a minimal valid synthetic minidump carrying an identifying
+    /// `LinuxEnviron` stream (with a username + secret) plus a kept thread-stack
+    /// stream, so we can prove the monitor minimizes BEFORE spooling.
+    fn synthetic_minidump_with_env(env_payload: &[u8], stack_payload: &[u8]) -> Vec<u8> {
+        // signature, version, stream_count=2, dir_rva=32
+        const HEADER_SIZE: usize = 32;
+        const DIR_ENTRY: usize = 12;
+        const SIG: u32 = 0x504d_444d;
+        // LinuxEnviron = 0x47670007, MemoryListStream = 5.
+        let streams: [(u32, &[u8]); 2] = [(0x4767_0007, env_payload), (5u32, stack_payload)];
+        let dir_rva = HEADER_SIZE;
+        let payloads_rva = dir_rva + streams.len() * DIR_ENTRY;
+        let mut buf = vec![0u8; payloads_rva];
+        buf[0..4].copy_from_slice(&SIG.to_le_bytes());
+        buf[4..8].copy_from_slice(&0xa793u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&(streams.len() as u32).to_le_bytes());
+        buf[12..16].copy_from_slice(&(dir_rva as u32).to_le_bytes());
+        let mut rvas = Vec::new();
+        for (_, p) in &streams {
+            rvas.push(buf.len());
+            buf.extend_from_slice(p);
+        }
+        for (i, (ty, p)) in streams.iter().enumerate() {
+            let off = dir_rva + i * DIR_ENTRY;
+            buf[off..off + 4].copy_from_slice(&ty.to_le_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&(p.len() as u32).to_le_bytes());
+            buf[off + 8..off + 12].copy_from_slice(&(rvas[i] as u32).to_le_bytes());
+        }
+        buf
+    }
+
     #[test]
-    fn on_minidump_created_spools_written_dump_and_exits() {
+    fn on_minidump_created_minimizes_deletes_raw_and_spools_scrubbed() {
+        use itasha_report_core::spool::Spool;
         let dir = std::env::temp_dir().join(format!(
             "w1tn3ss-monitor-spool-test-{}-{}",
             std::process::id(),
             crate::consent::Tier2ConsentToken::granted().nonce()
         ));
         let h = MonitorHandler::new(&dir);
-        // Simulate minidumper having written a dump file.
+        // Simulate minidumper having written a dump with an env block carrying PII.
+        let dump =
+            synthetic_minidump_with_env(b"USER=jane\0SECRET=hunter2\0", b"STACK-keepme-bytes");
         let (mut file, path) = h.create_minidump_file().unwrap();
         use std::io::Write;
-        file.write_all(&[0xAB; 256]).unwrap();
+        file.write_all(&dump).unwrap();
         drop(file);
+
         let action = h.on_minidump_created(Ok(MinidumpBinary {
             file: std::fs::File::open(&path).unwrap(),
             path: path.clone(),
             contents: None,
         }));
-        // `LoopAction` derives `PartialEq` but not `Debug`, so use `assert!`
-        // with `==` rather than `assert_eq!` (which requires `Debug`).
         assert!(action == LoopAction::Exit);
+
         let outcomes = h.take_outcomes();
         assert_eq!(outcomes.len(), 1);
-        match &outcomes[0] {
-            CaptureOutcome::MinidumpWritten { path } => assert!(path.exists()),
+        let spooled_path = match &outcomes[0] {
+            CaptureOutcome::MinidumpWritten { path, scrub } => {
+                assert!(path.exists());
+                // The scrub gate actually ran: the env stream was dropped.
+                assert_eq!(scrub.streams_dropped, 1);
+                assert!(scrub.bytes_zeroed > 0);
+                path.clone()
+            }
             other => panic!("expected MinidumpWritten, got {other:?}"),
-        }
+        };
+
+        // The RAW pre-scrub dump is gone — deleted in-handler.
+        assert!(
+            !path.exists(),
+            "the raw .dmp must be deleted immediately after minimization"
+        );
+
+        // The SPOOLED (scrubbed) minidump no longer contains the env PII, but
+        // keeps the thread-stack memory.
+        let spool = Spool::open(&dir).unwrap();
+        let back = spool.load(&spooled_path).unwrap();
+        let spooled_bytes = &back.attachments[0].bytes;
+        assert!(
+            !contains(spooled_bytes, b"jane"),
+            "env username must not survive into the spooled dump"
+        );
+        assert!(
+            !contains(spooled_bytes, b"hunter2"),
+            "env secret must not survive into the spooled dump"
+        );
+        assert!(
+            contains(spooled_bytes, b"STACK-keepme-bytes"),
+            "thread-stack memory (the backtrace) must be preserved"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn on_minidump_created_fails_closed_on_unparseable_dump_and_deletes_raw() {
+        let dir = std::env::temp_dir().join(format!(
+            "w1tn3ss-monitor-failclosed-{}-{}",
+            std::process::id(),
+            crate::consent::Tier2ConsentToken::granted().nonce()
+        ));
+        let h = MonitorHandler::new(&dir);
+        // Write NON-minidump bytes (no MDMP signature) — must NOT be spooled.
+        let (mut file, path) = h.create_minidump_file().unwrap();
+        use std::io::Write;
+        file.write_all(&[0xABu8; 256]).unwrap();
+        drop(file);
+
+        h.on_minidump_created(Ok(MinidumpBinary {
+            file: std::fs::File::open(&path).unwrap(),
+            path: path.clone(),
+            contents: None,
+        }));
+
+        let outcomes = h.take_outcomes();
+        assert!(
+            matches!(outcomes[0], CaptureOutcome::CaptureFailed { .. }),
+            "an unparseable dump must fail-closed, never spool"
+        );
+        // The raw dump is deleted even on fail-closed.
+        assert!(
+            !path.exists(),
+            "the raw .dmp must be deleted on fail-closed"
+        );
+        // Nothing was spooled.
+        let reports = dir.join("reports");
+        let spooled_count = std::fs::read_dir(&reports)
+            .map(|rd| rd.count())
+            .unwrap_or(0);
+        assert_eq!(spooled_count, 0, "no report may be spooled on fail-closed");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -238,5 +399,9 @@ mod tests {
         let outcomes = h.take_outcomes();
         assert!(matches!(outcomes[0], CaptureOutcome::CaptureFailed { .. }));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 }
