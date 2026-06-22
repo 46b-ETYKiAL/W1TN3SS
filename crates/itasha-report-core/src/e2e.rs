@@ -374,6 +374,7 @@ mod tests {
             home_dir: Some("/home/ada".to_string()),
             username: Some("ada".to_string()),
             hostname: Some("ada-laptop".to_string()),
+            ..Default::default()
         };
         let sanitizer = Sanitizer::with_identity(identity);
         let id = test_identity();

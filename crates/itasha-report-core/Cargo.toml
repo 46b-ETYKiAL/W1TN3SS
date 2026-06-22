@@ -31,6 +31,14 @@ directories = "=6.0.0"
 # safe-Rust (no `ssh`/`rsa`/`cli-common` feature pulled — keeps the surface
 # minimal + `#![forbid(unsafe_code)]`-clean for this crate).
 age = { version = "=0.11.3", default-features = false }
+# rand — the CSPRNG behind the ephemeral, UNLINKABLE per-report nonce
+# (anonymity hardening #1, gap D-2). `rand::rng().fill_bytes` draws from the OS
+# CSPRNG, so the nonce carries NO time component and NO monotonic counter — two
+# reports are not time-orderable nor sequence-adjacent. Pinned to =0.8.6 to
+# match the version `age` already resolves (no new transitive tree) and the
+# `safe-to-deploy` cargo-vet exemption already on record. Pure safe-Rust at this
+# crate's surface (`#![forbid(unsafe_code)]`-clean).
+rand = "=0.8.6"
 
 [dev-dependencies]
 proptest = "=1.8.0"

@@ -5,10 +5,24 @@
 //! the host machine might have — the sanitized output never leaks the home
 //! path, the username, or the hostname.
 
+use itasha_report_core::redact::{self, PATH_DROP, REDACTED};
 use itasha_report_core::report::Report;
-use itasha_report_core::sanitize::{HostIdentity, Sanitizer, HOME_PLACEHOLDER};
+use itasha_report_core::sanitize::{HostIdentity, Sanitizer};
 
 use proptest::prelude::*;
+
+/// A sanitizer with a fully-specified host identity (home + tmp + cache) so the
+/// path-anchoring property tests are deterministic.
+fn anchoring_sanitizer(user: &str) -> Sanitizer {
+    Sanitizer::with_identity(HostIdentity {
+        home_dir: Some(format!("/home/{user}")),
+        username: Some(user.to_string()),
+        hostname: Some(format!("{user}-host")),
+        tmp_dir: Some("/tmp".to_string()),
+        cache_dir: Some(format!("/home/{user}/.cache")),
+        config_dir: Some(format!("/home/{user}/.config")),
+    })
+}
 
 /// A username/hostname token: non-empty, alphanumeric + a few path-safe chars,
 /// long enough that accidental substring collisions are vanishingly unlikely.
@@ -35,14 +49,30 @@ proptest! {
             home_dir: Some(home.clone()),
             username: Some(user.clone()),
             hostname: Some(format!("{user}-host")),
+            ..Default::default()
         };
         let s = Sanitizer::with_identity(identity);
 
         let raw = format!("{prefix}{home}/{suffix}");
         let out = s.scrub_field(&raw);
-        // The literal home path must be gone; a placeholder stands in.
+        // The literal home path must be gone (the security guarantee). A visible
+        // placeholder must stand in (no silent deletion that could fuse adjacent
+        // tokens). Depending on the surrounding prefix/suffix the sanitizer
+        // pipeline legitimately emits ANY of these non-leaking substitutions:
+        // the legacy `<HOME>` (well-formed prefix match), a fail-closed path
+        // anchor (`<home>`/`<tmp>`/`<cache>`/`<src>`), the typeless `<path>` drop
+        // (malformed/foreign absolute path), the identity placeholders
+        // (`<USER>`/`<HOST>`), the whole-field `<redacted>` (a sensitive-looking
+        // field), or the size-cap `truncated` marker.
         prop_assert!(!out.contains(&home), "home path leaked: {out}");
-        prop_assert!(out.contains(HOME_PLACEHOLDER) || out.contains("truncated"));
+        const PLACEHOLDERS: &[&str] = &[
+            "<HOME>", "<home>", "<tmp>", "<cache>", "<src>", "<path>", "<USER>", "<HOST>",
+            "<scrubbed>", "<redacted>", "truncated",
+        ];
+        prop_assert!(
+            PLACEHOLDERS.iter().any(|p| out.contains(p)),
+            "no placeholder stood in for the home path: {out}"
+        );
     }
 
     /// For an arbitrary body that mentions the username as a standalone token,
@@ -57,6 +87,7 @@ proptest! {
             home_dir: Some(home_for(&user)),
             username: Some(user.clone()),
             hostname: Some(format!("{user}-host")),
+            ..Default::default()
         };
         let s = Sanitizer::with_identity(identity);
 
@@ -82,6 +113,7 @@ proptest! {
             home_dir: Some(home.clone()),
             username: Some(user.clone()),
             hostname: Some(format!("{user}-host")),
+            ..Default::default()
         };
         let s = Sanitizer::with_identity(identity);
 
@@ -126,5 +158,66 @@ proptest! {
         let s = Sanitizer::new().with_caps(SizeCaps { max_field_bytes: 256, max_lines: 100 });
         let out = s.scrub_field(&input);
         prop_assert!(out.len() <= 256, "size cap exceeded: {} > 256", out.len());
+    }
+
+    /// Anonymity hardening #3: an absolute path belonging to a DIFFERENT user
+    /// (one the sanitizer cannot attribute to the local home) never survives —
+    /// it is either anchored to a symbol or dropped to <path>. The foreign
+    /// username segment never appears in the output.
+    #[test]
+    fn foreign_user_absolute_path_never_leaks(
+        local in ident_token(),
+        foreign in ident_token(),
+        tail in "[a-zA-Z0-9/_.-]{1,30}",
+    ) {
+        prop_assume!(local != foreign);
+        let s = anchoring_sanitizer(&local);
+        // A foreign user's home-style path under a DIFFERENT root the anchoring
+        // does not recognize (/data/<foreign>/...).
+        let raw = format!("opened /data/{foreign}/{tail} now");
+        let out = s.scrub_field(&raw);
+        prop_assert!(!out.contains(&foreign), "foreign username leaked: {out}");
+        prop_assert!(!out.contains(&format!("/data/{foreign}")), "raw foreign path leaked: {out}");
+        prop_assert!(out.contains(PATH_DROP), "foreign path not dropped: {out}");
+    }
+
+    /// Anonymity hardening #4: an email embedded in arbitrary surrounding prose
+    /// is always redacted to the uniform token; the email never survives, and
+    /// the token carries no type tag.
+    #[test]
+    fn embedded_email_never_leaks(
+        pre in "[a-zA-Z ]{0,20}",
+        local in "[a-z][a-z0-9]{1,10}",
+        domain in "[a-z][a-z0-9]{1,8}",
+        post in "[a-zA-Z ]{0,20}",
+    ) {
+        let s = Sanitizer::new();
+        let email = format!("{local}@{domain}.com");
+        let raw = format!("{pre} {email} {post}");
+        let out = s.scrub_field(&raw);
+        prop_assert!(!out.contains(&email), "email leaked: {out}");
+        prop_assert!(out.contains(REDACTED), "email not redacted: {out}");
+        // Typeless: the literal "email" type tag must not be emitted as a marker.
+        prop_assert!(!out.contains("[email]"), "type tag leaked: {out}");
+    }
+}
+
+/// Anonymity hardening #4 (non-proptest): the redaction token reveals neither
+/// the TYPE nor the COUNT of redactions — a run of distinct PII shapes collapses
+/// to exactly one uniform token.
+#[test]
+fn redaction_is_typeless_and_count_collapsed() {
+    let out = redact::redact_free_text(
+        "a@b.com 10.0.0.1 00:11:22:33:44:55 550e8400-e29b-41d4-a716-446655440000",
+    );
+    // Exactly one token despite four distinct sensitive shapes.
+    assert_eq!(
+        out.matches(REDACTED).count(),
+        1,
+        "count not collapsed: {out}"
+    );
+    // No type tag of any kind leaked.
+    for tag in ["email", "ipv4", "mac", "uuid", "[ip]", "[email]"] {
+        assert!(!out.to_lowercase().contains(tag), "type tag leaked: {out}");
     }
 }

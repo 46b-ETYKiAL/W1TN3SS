@@ -62,6 +62,8 @@ pub mod e2e;
 pub mod envelope;
 pub mod intake;
 pub mod preview;
+pub mod quasi;
+pub mod redact;
 pub mod report;
 pub mod sanitize;
 pub mod spool;

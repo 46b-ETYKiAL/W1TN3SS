@@ -56,6 +56,7 @@ fn full_client_flow_scrub_preview_seal_envelope_then_developer_decrypts() {
         home_dir: Some("/home/ada".into()),
         username: Some("ada".into()),
         hostname: Some("ada-laptop".into()),
+        ..Default::default()
     });
     let scrubbed = sanitizer.sanitize(raw);
     assert!(scrubbed.body.contains("<HOME>"));
