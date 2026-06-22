@@ -13,6 +13,7 @@
 //! and a symbol). Anything that does not match the safe shape is replaced with
 //! a `<redacted>` marker rather than risk leaking a quasi-identifier.
 
+use crate::redact::{self, PathRoots};
 use crate::report::Report;
 
 /// Replacement marker for the user's home directory.
@@ -59,18 +60,44 @@ pub struct HostIdentity {
     pub username: Option<String>,
     /// Machine hostname.
     pub hostname: Option<String>,
+    /// OS temp directory, e.g. `/tmp` or `C:\Users\ada\AppData\Local\Temp`.
+    /// Used to anchor recognized temp paths to `<tmp>` (anonymity hardening #3).
+    pub tmp_dir: Option<String>,
+    /// OS cache directory (per-user). Anchored to `<cache>`.
+    pub cache_dir: Option<String>,
+    /// OS config directory (per-user). Anchored to `<cache>`.
+    pub config_dir: Option<String>,
 }
 
 impl HostIdentity {
-    /// Detect the host identity from the platform (home dir, username, host).
+    /// Detect the host identity from the platform (home dir, username, host,
+    /// tmp/cache/config dirs).
     ///
-    /// Uses `directories` for a platform-aware home and the standard
-    /// `USER`/`USERNAME` and `HOSTNAME`/`COMPUTERNAME` environment variables.
+    /// Uses `directories` for a platform-aware home + cache/config dirs and the
+    /// standard `USER`/`USERNAME` and `HOSTNAME`/`COMPUTERNAME` environment
+    /// variables. The tmp dir comes from `std::env::temp_dir()`.
     #[must_use]
     pub fn detect() -> Self {
-        let home_dir = directories::BaseDirs::new()
+        let base = directories::BaseDirs::new();
+        let home_dir = base
+            .as_ref()
             .map(|d| d.home_dir().to_string_lossy().into_owned())
             .filter(|s| !s.is_empty());
+        let cache_dir = base
+            .as_ref()
+            .map(|d| d.cache_dir().to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty());
+        let config_dir = base
+            .as_ref()
+            .map(|d| d.config_dir().to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty());
+        let tmp_dir = {
+            let t = std::env::temp_dir().to_string_lossy().into_owned();
+            // temp_dir may carry a trailing separator; trim it so the anchor
+            // covers the prefix cleanly.
+            let trimmed = t.trim_end_matches(['/', '\\']).to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        };
 
         let username = std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
@@ -86,7 +113,23 @@ impl HostIdentity {
             home_dir,
             username,
             hostname,
+            tmp_dir,
+            cache_dir,
+            config_dir,
         }
+    }
+
+    /// Build the recognized-path-root set this identity anchors to symbolic
+    /// roots (`<home>`/`<tmp>`/`<cache>`). Unrecognized absolute paths are
+    /// dropped downstream (fail-closed, anonymity hardening #3).
+    #[must_use]
+    pub fn path_roots(&self) -> PathRoots {
+        PathRoots::new(
+            self.home_dir.as_deref(),
+            self.tmp_dir.as_deref(),
+            self.cache_dir.as_deref(),
+            self.config_dir.as_deref(),
+        )
     }
 }
 
@@ -95,24 +138,30 @@ impl HostIdentity {
 pub struct Sanitizer {
     identity: HostIdentity,
     caps: SizeCaps,
+    roots: PathRoots,
 }
 
 impl Sanitizer {
     /// A sanitizer that detects the host identity from the environment.
     #[must_use]
     pub fn new() -> Self {
+        let identity = HostIdentity::detect();
+        let roots = identity.path_roots();
         Self {
-            identity: HostIdentity::detect(),
+            identity,
             caps: SizeCaps::default(),
+            roots,
         }
     }
 
     /// A sanitizer with an explicit host identity (for deterministic tests).
     #[must_use]
     pub fn with_identity(identity: HostIdentity) -> Self {
+        let roots = identity.path_roots();
         Self {
             identity,
             caps: SizeCaps::default(),
+            roots,
         }
     }
 
@@ -138,11 +187,19 @@ impl Sanitizer {
         report
     }
 
-    /// Scrub a single short field: strip identity tokens then size-cap.
+    /// Scrub a single short field: strip identity tokens, anchor/drop paths,
+    /// redact free-text PII/secrets, then size-cap.
+    ///
+    /// Anonymity hardenings #3 and #4: a short field (title, metadata value) is
+    /// free text that may carry a foreign path or a secret. After identity-strip
+    /// and path-anchoring (in [`strip_identity`]) the field passes through
+    /// [`redact::redact_free_text`] so emails / IPs / tokens / high-entropy
+    /// secrets become the uniform typeless `<redacted>` token.
     #[must_use]
     pub fn scrub_field(&self, input: &str) -> String {
         let stripped = self.strip_identity(input);
-        cap_bytes(&stripped, self.caps.max_field_bytes)
+        let redacted = redact::redact_free_text(&stripped);
+        cap_bytes(&redacted, self.caps.max_field_bytes)
     }
 
     /// Scrub a multi-line backtrace/body with the allowlist redaction policy,
@@ -181,7 +238,13 @@ impl Sanitizer {
                 s = replace_token(&s, user, USER_PLACEHOLDER);
             }
         }
-        s
+        // Anonymity hardening #3 (fail-closed path anchoring): after the local
+        // identity tokens are gone, anchor recognized roots to <home>/<tmp>/
+        // <cache>/<src> and DROP any UNRECOGNIZED absolute path (a foreign
+        // user's path, a mounted share, a cloud path) to <path>. The legacy
+        // <HOME> form above stays for backward-compat with existing tests; the
+        // anchoring is additive and catches everything <HOME> alone misses.
+        redact::anchor_paths(&s, &self.roots)
     }
 
     /// Apply the allowlist redaction to a single backtrace line.
@@ -192,8 +255,20 @@ impl Sanitizer {
     /// guarantees an unrecognized line cannot leak a quasi-identifier.
     fn scrub_line(&self, line: &str) -> String {
         let stripped = self.strip_identity(line);
-        if is_safe_shape(&stripped) {
-            stripped
+        // Frame-symbol lines (`   3: core::panicking::panic_fmt`) are kept
+        // verbatim — they are *your* code, the dedup signal, and must not be
+        // mangled by free-text redaction (a long symbol could otherwise trip the
+        // entropy detector).
+        if is_frame_symbol_line(stripped.trim()) {
+            return stripped;
+        }
+        // Panic messages + error chains are the HIGHEST free-text leak vector in
+        // a backtrace (devs interpolate user data into `panic!`/`expect!`).
+        // Anonymity hardening #4: redact secrets/PII to the uniform token before
+        // the allowlist check.
+        let redacted = redact::redact_free_text(&stripped);
+        if is_safe_shape(&redacted) {
+            redacted
         } else {
             REDACTED_MARKER.to_string()
         }
@@ -365,6 +440,9 @@ mod tests {
             home_dir: Some("/home/ada".to_string()),
             username: Some("ada".to_string()),
             hostname: Some("ada-laptop".to_string()),
+            tmp_dir: Some("/tmp".to_string()),
+            cache_dir: Some("/home/ada/.cache".to_string()),
+            config_dir: Some("/home/ada/.config".to_string()),
         }
     }
 
@@ -415,10 +493,21 @@ mod tests {
     fn unsafe_backtrace_line_is_redacted() {
         let s = sanitizer();
         // A line with a foreign user's absolute path the sanitizer cannot
-        // attribute to the known home → must be redacted by the allowlist.
+        // attribute to the known home. With fail-closed path anchoring
+        // (hardening #3) the foreign absolute path is dropped to the typeless
+        // <path> marker; if any residual still trips the allowlist, the whole
+        // line collapses to <redacted>. Either way the privacy invariant holds:
+        // the foreign username never survives, and no raw absolute path leaks.
         let out = s.scrub_backtrace("leaked /home/otheruser/secret/path.rs");
-        assert!(out.contains(REDACTED_MARKER));
-        assert!(!out.contains("otheruser"));
+        assert!(!out.contains("otheruser"), "foreign username leaked: {out}");
+        assert!(
+            !out.contains("/home/otheruser"),
+            "raw foreign path leaked: {out}"
+        );
+        assert!(
+            out.contains(crate::redact::PATH_DROP) || out.contains(REDACTED_MARKER),
+            "foreign path was neither anchored-dropped nor redacted: {out}"
+        );
     }
 
     #[test]
@@ -471,5 +560,68 @@ mod tests {
         let out = s.sanitize(r);
         assert!(!out.body.contains("/home/ada"));
         assert!(!out.metadata[0].1.contains("/home/ada"));
+    }
+
+    #[test]
+    fn foreign_absolute_path_is_dropped_not_passed_through() {
+        // Anonymity hardening #3: a path for a DIFFERENT user / a mounted share /
+        // a cloud path is not attributable to the local home → it must be DROPPED
+        // (fail closed), not passed through, even though it's not the local home.
+        let s = sanitizer();
+        let out = s.scrub_field("config at /mnt/share/teamjane/app.toml loaded");
+        assert!(!out.contains("teamjane"), "foreign path leaked: {out}");
+        assert!(
+            !out.contains("/mnt/share"),
+            "raw foreign path leaked: {out}"
+        );
+        assert!(
+            out.contains(crate::redact::PATH_DROP),
+            "path not dropped: {out}"
+        );
+    }
+
+    #[test]
+    fn tmp_path_anchors_to_symbol() {
+        let s = sanitizer();
+        let out = s.scrub_field("spooled /tmp/.org.app/cache.bin ok");
+        assert!(
+            out.contains(crate::redact::TMP_ANCHOR),
+            "tmp not anchored: {out}"
+        );
+        assert!(!out.contains("/tmp/.org.app"));
+    }
+
+    #[test]
+    fn high_entropy_secret_in_panic_message_is_redacted_to_uniform_token() {
+        // Anonymity hardening #4: a dev `panic!`/`expect!` that interpolated a
+        // secret/token. The secret is redacted to the uniform, typeless token.
+        let s = sanitizer();
+        let body = "thread 'main' panicked: bad bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.abcDEFghiJKL at lib.rs";
+        let out = s.scrub_backtrace(body);
+        assert!(
+            out.contains(crate::redact::REDACTED),
+            "secret not redacted: {out}"
+        );
+        assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"), "JWT leaked: {out}");
+        // The token is typeless — no "jwt"/"token"/"bearer-type" tag leaks.
+        assert!(!out.to_lowercase().contains("[jwt]"));
+    }
+
+    #[test]
+    fn redaction_token_carries_no_type_or_count() {
+        // The uniform redaction token must reveal neither the TYPE nor the COUNT
+        // of what was redacted (both are quasi-identifiers).
+        let s = sanitizer();
+        let out = s.scrub_field("ada@example.com 10.0.0.5 00:11:22:33:44:55");
+        // Typeless: none of the detector type names appear.
+        for tag in ["email", "ipv4", "mac", "[ip]", "[email]"] {
+            assert!(!out.to_lowercase().contains(tag), "type tag leaked: {out}");
+        }
+        // Count-collapsed: the three adjacent redactions become ONE token.
+        assert_eq!(
+            out.matches(crate::redact::REDACTED).count(),
+            1,
+            "redaction count not collapsed: {out}"
+        );
     }
 }

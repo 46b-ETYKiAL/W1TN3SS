@@ -108,8 +108,19 @@ impl Envelope {
     /// each opaque attachment becomes an `attachment` item. A crash report's
     /// first minidump-typed attachment is tagged `attachment_type =
     /// event.minidump` so Sentry symbolicates it.
+    ///
+    /// Anonymity hardening #2 (gap D-4): the `extra` metadata is NOT a raw
+    /// passthrough. It is filtered through the fail-closed allowlist
+    /// [`crate::quasi::safe_fields`], which emits ONLY the pre-approved,
+    /// COARSENED keys (`app_version`→minor, `os`→major.minor, `locale`→language)
+    /// and DROPS every unknown key + the always-dropped quasi/direct identifiers
+    /// (timezone, build-hash, argv, env, hostname, MAC, machine-GUID, the full
+    /// module list, …). A future host that attaches a new metadata key cannot
+    /// leak it to the wire by default — this is the structural fingerprint floor
+    /// for the lean (non-sealed) path.
     #[must_use]
     pub fn from_report(report: &Report, event_id: Option<String>) -> Self {
+        let safe = crate::quasi::safe_fields(&report.metadata);
         let event_json = serde_json::json!({
             "level": match report.stream {
                 Stream::CrashReports => "error",
@@ -117,8 +128,7 @@ impl Envelope {
             },
             "message": report.title,
             "logentry": { "formatted": report.body },
-            "extra": report
-                .metadata
+            "extra": safe
                 .iter()
                 .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                 .collect::<serde_json::Map<_, _>>(),
@@ -284,6 +294,48 @@ mod tests {
         assert_eq!(env, back);
         assert_eq!(back.items.len(), 1);
         assert_eq!(back.items[0].item_type, "event");
+    }
+
+    #[test]
+    fn lean_envelope_allowlists_and_coarsens_metadata() {
+        // Anonymity hardening #2: on the lean (plaintext) path the `extra`
+        // metadata must be the fail-closed allowlist output — coarsened
+        // allowlisted keys only, every unknown/quasi-identifier key dropped.
+        let report = Report::crash("panic")
+            .with_metadata("app_version", "1.4.37-rc2+sha")
+            .with_metadata("os", "Windows 11 26100.1234")
+            .with_metadata("locale", "en-US")
+            .with_metadata("timezone", "America/New_York")
+            .with_metadata("hostname", "ada-laptop")
+            .with_metadata("modules", "ntdll.dll,evil-av.dll")
+            .with_metadata("brand_new_field", "leak me");
+        let env = Envelope::from_report(&report, Some("e".repeat(32)));
+        let wire = String::from_utf8(env.to_bytes()).unwrap();
+
+        // Coarsened allowlisted values are present.
+        assert!(wire.contains("\"app_version\":\"1.4\""));
+        assert!(wire.contains("\"os\":\"Windows 11\""));
+        assert!(wire.contains("\"locale\":\"en\""));
+        // The exact patch/build/region must be gone.
+        assert!(!wire.contains("1.4.37"));
+        assert!(!wire.contains("26100"));
+        assert!(!wire.contains("en-US"));
+        // Every dropped quasi/unknown key + value is absent from the wire.
+        for needle in [
+            "timezone",
+            "America",
+            "hostname",
+            "ada-laptop",
+            "modules",
+            "evil-av",
+            "brand_new_field",
+            "leak me",
+        ] {
+            assert!(
+                !wire.contains(needle),
+                "dropped content leaked to wire: {needle}"
+            );
+        }
     }
 
     #[test]

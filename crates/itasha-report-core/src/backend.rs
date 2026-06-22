@@ -208,8 +208,14 @@ impl IngestBackend for SentryStubBackend {
 }
 
 /// Derive a 32-hex-char Sentry `event_id` from the ephemeral consent nonce.
-/// Deterministic over the nonce only; carries no stable identity because the
-/// nonce itself is per-report and ephemeral.
+///
+/// Anonymity hardening #1 (gap D-2): the nonce is now 16 bytes of OS-CSPRNG
+/// output (32 lowercase hex chars), so this is effectively a passthrough —
+/// the wire `event_id` inherits the nonce's UNLINKABLE property. There is no
+/// time component and no monotonic counter to leak: the id carries no stable
+/// identity AND cannot be used to reconstruct submission ordering/timing. The
+/// hex-filter + pad/truncate is retained defensively so any future nonce shape
+/// still yields a well-formed 32-hex id.
 fn event_id_from_nonce(nonce: &str) -> String {
     let mut hex: String = nonce.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     hex.truncate(32);
