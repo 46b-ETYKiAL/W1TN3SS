@@ -1,0 +1,29 @@
+# gitleaks configuration for the W1TN3SS client SDK.
+#
+# `extend.useDefault = true` keeps the full upstream gitleaks ruleset (the
+# secret scan is NOT weakened) and layers a single, narrowly-scoped allowlist
+# on top of it.
+#
+# The redaction module `crates/itasha-report-core/src/redact.rs` is the SDK's
+# PII/secret stripper. Its `#[cfg(test)]` unit tests necessarily embed SAMPLE
+# secrets (a canonical example JWT, a fake `AKIA…` key, RFC-1918 IPs, a sample
+# MAC, the all-zero UUID) so the tests can assert the redactor REMOVES them.
+# These are deliberate, non-functional test fixtures — never real credentials.
+# We scope the allowlist to that one file's test secrets by exact regex so a
+# genuine secret committed anywhere else (including elsewhere in this file)
+# still fails the scan.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Redaction-module test fixtures (synthetic sample secrets used to prove the redactor strips them)."
+paths = [
+  '''crates/itasha-report-core/src/redact\.rs''',
+]
+regexes = [
+  # Canonical example JWT (jwt.io sample-style header.payload.signature).
+  '''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.dozjgNryP4J3jVmNHl0w5N''',
+  # Fake AWS-style access key used as a redaction test fixture.
+  '''AKIA1234567890ABCDEF''',
+]

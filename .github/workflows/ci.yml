@@ -1,0 +1,97 @@
+# W1TN3SS client CI — code-quality gates (plan-730-G2 follow-up).
+#
+# The release-sign.yml workflow guards the *supply chain* (cargo-audit / vet /
+# auditable). It does NOT guard *code quality*, so a clippy/fmt/test regression
+# or a leaked secret could land unchecked. This workflow closes that gap: it
+# runs on every PR + push to main and gates on
+#   * cargo fmt   — formatting is canonical, no drift.
+#   * cargo clippy — lints are errors (-D warnings); no new lint debt.
+#   * cargo test   — the workspace test suite is green (--locked, no lockfile drift).
+#   * gitleaks     — no secret is committed (OSS binary, no paid license).
+#
+# Every job is unconditional (`if: always()` is unnecessary because none of the
+# jobs are path/conditionally filtered — they always run). Where a step is
+# conditional, it uses the explicit-`if` + guarded-pass pattern so a skipped
+# step never reports "skipped == success" to the merge queue
+# (see merge-queue-check-gating.md). Action refs are SHA-pinned to mirror
+# release-sign.yml's supply-chain discipline.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # fmt + clippy + test: the Rust code-quality gate.
+  # ---------------------------------------------------------------------------
+  quality:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + git + build
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ci-
+
+      - name: cargo fmt (formatting gate)
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (lint gate, warnings = errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test (workspace suite, locked)
+        run: cargo test --all --locked
+
+  # ---------------------------------------------------------------------------
+  # gitleaks: secret-scanning gate. We install the OSS binary directly rather
+  # than gitleaks/gitleaks-action@v2 — the action requires a GITLEAKS_LICENSE
+  # for organization repos and pins a Node version slated for removal. The
+  # binary is Apache-2.0 / MIT OSS and needs no license or paid service.
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+    steps:
+      - name: Checkout (full history for full-repo scan)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks (OSS binary, pinned + checksum-free hardening)
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL "$url" -o gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: gitleaks detect (full repo + history)
+        run: gitleaks detect --source . --redact --verbose --exit-code 1

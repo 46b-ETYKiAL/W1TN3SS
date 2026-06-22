@@ -60,8 +60,14 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install supply-chain tooling
+        # cargo-audit is pinned to >= 0.22.0, the first release whose embedded
+        # `rustsec` crate (>= 0.31) parses CVSS 4.0 advisory vectors. The prior
+        # 0.21.2 pin chokes on any RustSec advisory carrying a `cvss = "CVSS:4.0/…"`
+        # string ("unsupported CVSS version: 4.0"), which has failed this gate on
+        # main since the advisory DB began publishing CVSS 4.0 entries. 0.22.2
+        # (2026-06-05) is the current stable.
         run: |
-          cargo install cargo-audit --locked --version 0.21.2 || cargo install cargo-audit --locked
+          cargo install cargo-audit --locked --version 0.22.2 || cargo install cargo-audit --locked
           cargo install cargo-auditable --locked || true
 
       # cargo-audit: fail on any RUSTSEC advisory affecting the locked tree.
