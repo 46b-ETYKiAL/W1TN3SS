@@ -300,4 +300,89 @@ mod tests {
         assert_eq!(listed, vec![p0, p1]);
         fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn spool_error_display_renders_both_arms() {
+        // SpoolError Display (lines 27-33): the Io arm and the Serialize arm each
+        // format with their distinct prefix and the inner error.
+        let io = SpoolError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file",
+        ));
+        let io_shown = format!("{io}");
+        assert!(io_shown.starts_with("spool io error:"), "got: {io_shown}");
+        assert!(io_shown.contains("no such file"));
+        let dyn_io: &dyn std::error::Error = &io;
+        assert!(dyn_io.to_string().starts_with("spool io error:"));
+
+        // Serialize arm via a real serde_json error.
+        let serde_err = serde_json::from_str::<Report>("not json").unwrap_err();
+        let ser = SpoolError::Serialize(serde_err);
+        assert!(format!("{ser}").starts_with("spool serialize error:"));
+    }
+
+    #[test]
+    fn spool_error_from_io_and_serde_conversions() {
+        // From<std::io::Error> (lines 38-41) and From<serde_json::Error>
+        // (lines 44-47): the `?` conversions yield the right variants.
+        let io_err = std::io::Error::other("disk full");
+        let converted: SpoolError = io_err.into();
+        assert!(matches!(converted, SpoolError::Io(_)));
+
+        let serde_err = serde_json::from_str::<Report>("{bad").unwrap_err();
+        let converted: SpoolError = serde_err.into();
+        assert!(matches!(converted, SpoolError::Serialize(_)));
+    }
+
+    #[test]
+    fn load_missing_file_is_io_error() {
+        // load (line 152): reading a non-existent path surfaces an Io error via
+        // the From<std::io::Error> conversion (the `?`).
+        let dir = tmp_dir();
+        let spool = Spool::open(&dir).unwrap();
+        let missing = dir.join("reports").join("report-nope.json");
+        let err = spool.load(&missing).unwrap_err();
+        assert!(matches!(err, SpoolError::Io(_)), "expected Io, got {err:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_corrupt_file_is_serialize_error() {
+        // load (line 153): a present-but-non-JSON report file deserializes to a
+        // Serialize error, not a panic.
+        let dir = tmp_dir();
+        let spool = Spool::open(&dir).unwrap();
+        let bad = spool.dir().join("report-corrupt.json");
+        fs::write(&bad, b"this is not valid json {{{").unwrap();
+        let err = spool.load(&bad).unwrap_err();
+        assert!(
+            matches!(err, SpoolError::Serialize(_)),
+            "expected Serialize, got {err:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_missing_file_is_io_error() {
+        // remove (line 158): deleting a path that does not exist surfaces an Io
+        // error rather than silently succeeding.
+        let dir = tmp_dir();
+        let spool = Spool::open(&dir).unwrap();
+        let missing = spool.dir().join("report-gone.json");
+        let err = spool.remove(&missing).unwrap_err();
+        assert!(matches!(err, SpoolError::Io(_)), "expected Io, got {err:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn total_bytes_tracks_written_reports() {
+        // total_bytes (lines 142-148): the sum of file sizes is > 0 after an
+        // enqueue and 0 on an empty spool.
+        let dir = tmp_dir();
+        let spool = Spool::open(&dir).unwrap();
+        assert_eq!(spool.total_bytes().unwrap(), 0);
+        spool.enqueue(&Report::crash("measure me")).unwrap();
+        assert!(spool.total_bytes().unwrap() > 0);
+        fs::remove_dir_all(&dir).ok();
+    }
 }

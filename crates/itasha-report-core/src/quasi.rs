@@ -321,6 +321,69 @@ mod tests {
     }
 
     #[test]
+    fn allowlisted_key_with_uncoarsenable_value_is_dropped() {
+        // safe_fields (line 109): an allowlisted key whose value coarsens to None
+        // (here app_version="garbage" → None) is DROPPED, not emitted as a
+        // placeholder. Only the coarsenable os survives.
+        let meta = vec![
+            ("app_version".to_string(), "garbage".to_string()),
+            ("os".to_string(), "linux".to_string()),
+            ("locale".to_string(), "123".to_string()),
+        ];
+        let out = safe_fields(&meta);
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["os"], "uncoarsenable allowlisted keys must drop");
+        assert_eq!(out[0].1, "linux");
+    }
+
+    #[test]
+    fn version_minor_defaults_to_zero_when_non_numeric() {
+        // coarsen_version (lines 137-141): a non-numeric minor token falls back to
+        // "0" rather than leaking the raw text.
+        assert_eq!(coarsen_version("2.x").as_deref(), Some("2.0"));
+        assert_eq!(coarsen_version("2.beta").as_deref(), Some("2.0"));
+        // An empty minor (trailing dot) also defaults to 0.
+        assert_eq!(coarsen_version("5.").as_deref(), Some("5.0"));
+    }
+
+    #[test]
+    fn coarsen_os_breaks_on_non_alnum_after_name() {
+        // coarsen_os (line 169 — the `break`): a token whose first char is neither
+        // alphabetic nor a digit (and no version taken yet) terminates the scan.
+        // Here the leading "(" token stops accumulation before any version.
+        assert_eq!(coarsen_os("Debian (sid) 13").as_deref(), Some("Debian"));
+    }
+
+    #[test]
+    fn coarsen_os_returns_none_when_no_words_survive() {
+        // coarsen_os (line 178 — `if words.is_empty()`): an input whose only
+        // tokens are non-alpha/non-digit yields no words → None.
+        assert_eq!(coarsen_os("(((").as_deref(), None);
+        assert_eq!(coarsen_os("-- ::").as_deref(), None);
+    }
+
+    #[test]
+    fn coarsen_os_version_token_rejects_non_numeric_major() {
+        // coarsen_os hitting coarsen_os_version_token (line 189-190): a numeric-led
+        // OS token whose major segment is empty/non-numeric is rejected. A token
+        // starting with a digit but with an empty major (".5") returns None and is
+        // skipped, leaving only the platform name.
+        assert_eq!(coarsen_os("Plan9 .5").as_deref(), Some("Plan9"));
+    }
+
+    #[test]
+    fn coarsen_locale_rejects_empty_and_non_alpha_language() {
+        // coarsen_locale (line 207 — `if lang.is_empty() || ...`): a leading
+        // separator yields an empty language subtag → None; a numeric leading run
+        // also fails the all-alphabetic check.
+        assert_eq!(coarsen_locale("-US").as_deref(), None);
+        assert_eq!(coarsen_locale("_BR").as_deref(), None);
+        assert_eq!(coarsen_locale("9x-YZ").as_deref(), None);
+        // Whitespace-only coarsens to None via the earlier empty guard.
+        assert_eq!(coarsen_locale("   ").as_deref(), None);
+    }
+
+    #[test]
     fn allowlist_output_order_is_stable_regardless_of_input_order() {
         let a = vec![
             ("locale".to_string(), "fr-FR".to_string()),

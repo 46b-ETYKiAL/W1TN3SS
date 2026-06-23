@@ -470,4 +470,86 @@ mod tests {
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
+
+    #[test]
+    fn developer_recipient_debug_is_identity_free() {
+        // DeveloperRecipient Debug (lines 63-67) must print a fixed, key-free
+        // string — never the public key material.
+        let id = test_identity();
+        let recipient = id.to_recipient();
+        let dbg = format!("{recipient:?}");
+        assert_eq!(dbg, "DeveloperRecipient(<age x25519 public key>)");
+        // The actual key string must not appear in Debug output.
+        let key = recipient.inner.to_string();
+        assert!(!dbg.contains(&key), "key material leaked in Debug: {dbg}");
+    }
+
+    #[test]
+    fn developer_identity_debug_redacts_secret() {
+        // DeveloperIdentity Debug (lines 95-98) must NEVER print secret material.
+        let id = test_identity();
+        let dbg = format!("{id:?}");
+        assert_eq!(dbg, "DeveloperIdentity(<age x25519 secret key, redacted>)");
+        // The Debug output must be exactly the fixed redacted string — it carries
+        // no per-key bytes, so two distinct identities Debug-print identically.
+        let other = test_identity();
+        assert_eq!(
+            format!("{other:?}"),
+            dbg,
+            "Debug must not vary with the key"
+        );
+        // And it must contain no age secret-key prefix.
+        assert!(
+            !dbg.contains("AGE-SECRET-KEY"),
+            "secret-key material leaked in Debug: {dbg}"
+        );
+    }
+
+    #[test]
+    fn e2e_error_display_renders_every_variant() {
+        // E2eError Display (lines 142-151): each variant formats with its prefix
+        // and inner message, all distinct and non-panicking.
+        let cases = [
+            (
+                E2eError::InvalidRecipient("bad".into()),
+                "invalid developer recipient: bad",
+            ),
+            (
+                E2eError::InvalidIdentity("nope".into()),
+                "invalid developer identity: nope",
+            ),
+            (E2eError::NoRecipients, "no developer recipients supplied"),
+            (E2eError::Encrypt("boom".into()), "e2e encrypt failed: boom"),
+            (
+                E2eError::Decrypt("tamper".into()),
+                "e2e decrypt failed: tamper",
+            ),
+            (
+                E2eError::Payload("garbage".into()),
+                "e2e payload error: garbage",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(format!("{err}"), expected);
+            // It is a real std::error::Error too (line 154).
+            let dyn_err: &dyn std::error::Error = &err;
+            assert_eq!(dyn_err.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn sealed_payload_into_bytes_yields_the_ciphertext() {
+        // SealedPayload::into_bytes (lines 200-202) consumes the wrapper and
+        // returns exactly the ciphertext bytes that bytes() borrows.
+        let id = test_identity();
+        let report = Report::crash("into-bytes");
+        let sealed = seal_report(&report, &[id.to_recipient()]).unwrap();
+        let borrowed = sealed.bytes().to_vec();
+        let owned = sealed.into_bytes();
+        assert_eq!(owned, borrowed);
+        assert!(!owned.is_empty());
+        // The owned bytes round-trip back through from_bytes unchanged.
+        let rewrapped = SealedPayload::from_bytes(owned.clone());
+        assert_eq!(rewrapped.bytes(), &owned[..]);
+    }
 }

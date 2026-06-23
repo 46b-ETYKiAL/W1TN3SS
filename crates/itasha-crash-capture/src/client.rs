@@ -207,6 +207,56 @@ mod tests {
         assert!(cfg.monitor_exe.is_none());
     }
 
+    /// `CaptureConfig` fields are all settable + readable: the default socket,
+    /// an explicit config_dir, and an explicit monitor_exe override.
+    #[test]
+    fn capture_config_fields_are_settable() {
+        let mut cfg = CaptureConfig::new("/tmp/witness-cfg");
+        assert_eq!(cfg.config_dir, std::path::PathBuf::from("/tmp/witness-cfg"));
+        assert_eq!(cfg.socket_name, crate::monitor::DEFAULT_SOCKET_NAME);
+        assert!(cfg.monitor_exe.is_none());
+
+        cfg.socket_name = "custom-socket".to_string();
+        cfg.monitor_exe = Some(std::path::PathBuf::from("/opt/w1tn3ss/monitor"));
+        assert_eq!(cfg.socket_name, "custom-socket");
+        assert_eq!(
+            cfg.monitor_exe.as_deref(),
+            Some(std::path::Path::new("/opt/w1tn3ss/monitor"))
+        );
+        // CaptureConfig is Clone + Debug (used by host wiring + logs).
+        let cloned = cfg.clone();
+        assert_eq!(cloned.socket_name, cfg.socket_name);
+        assert!(format!("{cfg:?}").contains("custom-socket"));
+    }
+
+    /// `ArmError`'s `Display` (client.rs 50-56) renders each variant with a
+    /// human-readable, non-empty message wrapping the inner error. We can
+    /// construct `SpawnMonitor` from a real `std::io::Error` without spawning a
+    /// process; the other two arms are exercised via their inner error types.
+    #[test]
+    fn arm_error_display_renders_each_variant() {
+        let spawn = ArmError::SpawnMonitor(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "monitor exe missing",
+        ));
+        let spawn_msg = format!("{spawn}");
+        assert!(spawn_msg.contains("failed to spawn crash monitor"));
+        assert!(spawn_msg.contains("monitor exe missing"));
+
+        let connect = ArmError::Connect(minidumper::Error::InvalidName);
+        let connect_msg = format!("{connect}");
+        assert!(connect_msg.contains("failed to connect to crash monitor"));
+
+        let attach = ArmError::AttachHandler(crash_handler::Error::OutOfMemory);
+        let attach_msg = format!("{attach}");
+        assert!(attach_msg.contains("failed to attach crash handler"));
+
+        // ArmError implements std::error::Error + Debug (host bubbles it up).
+        let e: &dyn std::error::Error = &spawn;
+        assert!(e.source().is_none());
+        assert!(format!("{spawn:?}").contains("SpawnMonitor"));
+    }
+
     #[test]
     fn arm_capture_requires_a_tier2_token_at_the_type_level() {
         // This test documents the type-level gate: `arm_capture`'s signature

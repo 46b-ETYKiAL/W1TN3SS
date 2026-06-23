@@ -99,8 +99,19 @@ pub fn mailto_url(address: &str, subject: &str, body: &str) -> String {
 /// Returns `Err` with a non-identifying message if the browser could not be
 /// launched (e.g. headless / offline) — the caller should then use the
 /// clipboard fallback.
+///
+/// The actual `webbrowser::open` syscall is the only line here that touches the
+/// OS; the error mapping is delegated to the pure [`map_launch_error`] helper so
+/// the non-identifying-message contract is unit-testable WITHOUT spawning a real
+/// browser process (a real spawn would leak a child process past test end).
 pub fn launch(url: &str) -> Result<(), String> {
-    webbrowser::open(url).map_err(|e| format!("could not open browser: {e}"))
+    webbrowser::open(url).map_err(|e| map_launch_error(&e))
+}
+
+/// Map a browser-launch failure to a non-identifying message. Pure; carries no
+/// URL or host of ours beyond what the OS error layer surfaces.
+fn map_launch_error(e: &impl std::fmt::Display) -> String {
+    format!("could not open browser: {e}")
 }
 
 /// Percent-encode a string for a URL query component (RFC 3986). Encodes
@@ -228,5 +239,17 @@ mod tests {
         assert!(url.starts_with("mailto:support@example.com?"));
         assert!(url.contains("subject=crash%20report"));
         assert!(url.contains("body=a%20%26%20b"));
+    }
+
+    #[test]
+    fn map_launch_error_produces_non_identifying_message() {
+        // map_launch_error is the pure error-mapping half of `launch`. We test it
+        // directly — without invoking `webbrowser::open`, which on a desktop would
+        // spawn a real browser child process that outlives the test (a leak). The
+        // mapped message is the non-identifying "could not open browser:" form and
+        // carries only what the OS error layer surfaces (here, our synthetic one).
+        let msg = map_launch_error(&"no display server");
+        assert_eq!(msg, "could not open browser: no display server");
+        assert!(msg.starts_with("could not open browser:"));
     }
 }

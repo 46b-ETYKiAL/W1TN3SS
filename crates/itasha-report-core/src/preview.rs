@@ -163,6 +163,17 @@ mod tests {
     }
 
     #[test]
+    fn redact_with_empty_span_is_a_noop() {
+        // redact (line 72): an empty `span` must be a no-op — `replace("", x)`
+        // would otherwise splice the replacement between every char.
+        let r = Report::manual_issue("title", "untouched body");
+        let before = Preview::of(&r);
+        let after = before.clone().redact("", "[x]");
+        assert_eq!(after.text(), before.text());
+        assert!(!after.text().contains("[x]"));
+    }
+
+    #[test]
     fn edited_preview_round_trips_into_report_body() {
         let r = Report::manual_issue("title", "original body");
         let edited = Preview::of(&r)

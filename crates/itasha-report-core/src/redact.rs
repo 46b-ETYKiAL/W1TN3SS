@@ -584,4 +584,53 @@ mod tests {
         let out = redact_free_text("internationalization failed unexpectedly");
         assert_eq!(out, "internationalization failed unexpectedly");
     }
+
+    #[test]
+    fn windows_backslash_root_registers_a_forward_slash_alt() {
+        // PathRoots::new (line 69-72): a Windows home with backslashes also
+        // registers a forward-slash-normalized alt, so a tool that emitted the
+        // home with '/' separators still anchors to <home>.
+        let r = PathRoots::new(Some("C:\\Users\\ada"), None, None, None);
+        // Backslash form anchors.
+        assert_eq!(
+            anchor_paths("at C:\\Users\\ada\\proj\\m.rs:1", &r),
+            "at <home>\\proj\\m.rs:1"
+        );
+        // Forward-slash form of the SAME root also anchors (the alt registration).
+        assert_eq!(
+            anchor_paths("at C:/Users/ada/proj/m.rs:1", &r),
+            "at <home>/proj/m.rs:1"
+        );
+    }
+
+    #[test]
+    fn token_that_is_all_edge_punct_is_returned_unchanged() {
+        // redact_token (lines 270-275): when leading+trailing edge-punct cover the
+        // whole token there is no identifier core to inspect — the token is
+        // returned verbatim, never sliced with begin>end (no panic).
+        let out = redact_free_text("... !!! (((");
+        assert_eq!(out, "... !!! (((");
+    }
+
+    #[test]
+    fn punctuation_wrapped_email_is_redacted_core_only() {
+        // redact_token: leading/trailing prose punctuation is preserved AROUND the
+        // redaction while the identifying core is replaced.
+        let out = redact_free_text("(ada@example.com).");
+        assert!(out.contains(REDACTED));
+        assert!(!out.contains("ada@example.com"));
+        // The wrapping punctuation survives so prose stays readable.
+        assert!(out.starts_with('('));
+        assert!(out.ends_with(')') || out.ends_with('.'));
+    }
+
+    #[test]
+    fn trailing_non_whitespace_run_is_preserved_losslessly() {
+        // split_keep_ws (line 246-248): an input that ENDS in a non-whitespace run
+        // must push that final piece, so a trailing benign token survives.
+        let out = redact_free_text("crash at startup");
+        assert_eq!(out, "crash at startup");
+        // A leading-whitespace input also round-trips losslessly.
+        assert_eq!(redact_free_text("  spaced  out  "), "  spaced  out  ");
+    }
 }

@@ -404,4 +404,212 @@ mod tests {
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
+
+    /// `on_message` is a deliberate no-op (inbound bytes are data, never
+    /// executed — AES Clause 9). Calling it records NOTHING and never panics.
+    #[test]
+    fn on_message_is_an_inert_noop() {
+        let dir = std::env::temp_dir().join(format!("w1tn3ss-monitor-msg-{}", std::process::id()));
+        let h = MonitorHandler::new(&dir);
+        h.on_message(7, vec![1, 2, 3, 4]);
+        h.on_message(0, Vec::new());
+        // No outcome is recorded by a message — capture is driven only by dumps.
+        assert!(h.take_outcomes().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The read-dump-fail branch (monitor.rs 129-136): a `MinidumpBinary` whose
+    /// `path` points at a non-existent file makes `std::fs::read` fail →
+    /// `CaptureFailed { reason }` containing "read dump failed", and the loop
+    /// still exits.
+    #[test]
+    fn on_minidump_created_fails_closed_when_raw_dump_is_unreadable() {
+        let dir = std::env::temp_dir().join(format!(
+            "w1tn3ss-monitor-readfail-{}-{}",
+            std::process::id(),
+            crate::consent::Tier2ConsentToken::granted().nonce()
+        ));
+        let h = MonitorHandler::new(&dir);
+        let missing = dir.join("does-not-exist.dmp");
+        // A real File handle is required by MinidumpBinary; point it at /dev/null
+        // equivalent — but `path` (what the handler reads) is the missing file.
+        // We open the handler's own dump-dir file as a throwaway File, then pass
+        // the missing path so the read in minimize_delete_and_spool fails.
+        let (throwaway, _real_path) = h.create_minidump_file().unwrap();
+        let action = h.on_minidump_created(Ok(MinidumpBinary {
+            file: throwaway,
+            path: missing.clone(),
+            contents: None,
+        }));
+        assert!(action == LoopAction::Exit);
+        let outcomes = h.take_outcomes();
+        match &outcomes[0] {
+            CaptureOutcome::CaptureFailed { reason } => {
+                assert!(
+                    reason.contains("read dump failed"),
+                    "expected a read-dump failure reason, got: {reason}"
+                );
+            }
+            other => panic!("expected CaptureFailed, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The spool-fail branch (monitor.rs 174-176): the dump reads + scrubs +
+    /// raw-deletes fine, but the spool cannot be opened because `config_dir` is a
+    /// regular FILE (so `<config_dir>/reports` cannot be created). The outcome is
+    /// `CaptureFailed` with a "spool failed" reason, and the raw dump is still
+    /// deleted.
+    #[test]
+    fn on_minidump_created_fails_closed_when_spool_cannot_open() {
+        let base = std::env::temp_dir().join(format!(
+            "w1tn3ss-monitor-spoolfail-{}-{}",
+            std::process::id(),
+            crate::consent::Tier2ConsentToken::granted().nonce()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        // config_dir is a FILE → Spool::open's create_dir_all("<file>/reports")
+        // fails → spool_minidump returns Err.
+        let config_file = base.join("config-is-a-file");
+        std::fs::write(&config_file, b"not a directory").unwrap();
+        let h = MonitorHandler::new(&config_file);
+
+        // Write a VALID minidump at a raw path OUTSIDE config_dir so the read +
+        // scrub + delete steps all succeed and only the spool step fails.
+        let raw_path = base.join("raw.dmp");
+        let dump = synthetic_minidump_with_env(b"USER=jane\0", b"STACK-keepme");
+        std::fs::write(&raw_path, &dump).unwrap();
+
+        h.on_minidump_created(Ok(MinidumpBinary {
+            file: std::fs::File::open(&raw_path).unwrap(),
+            path: raw_path.clone(),
+            contents: None,
+        }));
+
+        let outcomes = h.take_outcomes();
+        match &outcomes[0] {
+            CaptureOutcome::CaptureFailed { reason } => {
+                assert!(
+                    reason.contains("spool failed"),
+                    "expected a spool failure reason, got: {reason}"
+                );
+            }
+            other => panic!("expected CaptureFailed (spool), got {other:?}"),
+        }
+        // The raw dump was deleted BEFORE the spool attempt (fail-closed step 3).
+        assert!(
+            !raw_path.exists(),
+            "the raw .dmp must be deleted before the spool step"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The raw-delete-fail branch (monitor.rs 158-166): the dump reads + scrubs
+    /// fine, but `remove_file(raw_path)` fails because a second handle holds the
+    /// file open with a share mode that denies DELETE. Windows-only: this is the
+    /// only portable way to make `remove_file` fail while `read` still succeeds
+    /// (POSIX `unlink` succeeds on an open file, so the branch is not reachable
+    /// the same way on Unix — documented as platform-conditional).
+    #[cfg(windows)]
+    #[test]
+    fn on_minidump_created_fails_closed_when_raw_delete_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "w1tn3ss-monitor-deletefail-{}-{}",
+            std::process::id(),
+            crate::consent::Tier2ConsentToken::granted().nonce()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw_path = dir.join("raw.dmp");
+        let dump = synthetic_minidump_with_env(b"USER=jane\0", b"STACK-keepme");
+        std::fs::write(&raw_path, &dump).unwrap();
+
+        // Open with FILE_SHARE_READ | FILE_SHARE_WRITE (=3), DENYING the DELETE
+        // share. `std::fs::read` (which requests a delete-shareable handle) still
+        // succeeds for reading, but `remove_file` is blocked while this handle is
+        // alive → the raw-delete-fail branch fires.
+        let _guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&raw_path)
+            .unwrap();
+
+        let h = MonitorHandler::new(&dir);
+        h.on_minidump_created(Ok(MinidumpBinary {
+            file: std::fs::File::open(&raw_path).unwrap(),
+            path: raw_path.clone(),
+            contents: None,
+        }));
+
+        let outcomes = h.take_outcomes();
+        match &outcomes[0] {
+            CaptureOutcome::CaptureFailed { reason } => {
+                assert!(
+                    reason.contains("raw dump delete failed"),
+                    "expected a raw-delete failure reason, got: {reason}"
+                );
+            }
+            other => panic!("expected CaptureFailed (raw delete), got {other:?}"),
+        }
+        // Nothing was spooled — the fail-closed path returns before the spool.
+        let spooled = std::fs::read_dir(dir.join("reports"))
+            .map(|rd| rd.count())
+            .unwrap_or(0);
+        assert_eq!(spooled, 0, "no report may be spooled on raw-delete failure");
+        drop(_guard);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `run_monitor` returns an `Err` fast (no blocking server loop) when the
+    /// socket name cannot be bound — an over-long path is rejected by
+    /// `minidumper` before any OS resource is created. Exercises the
+    /// `Server::with_name(...)?` early-return arm (monitor.rs 224).
+    #[test]
+    fn run_monitor_errors_fast_on_unbindable_socket() {
+        let dir = std::env::temp_dir().join(format!("w1tn3ss-run-monitor-{}", std::process::id()));
+        let shutdown = AtomicBool::new(false);
+        let bad_socket = format!("w1tn3ss-{}", "x".repeat(200));
+        let result = run_monitor(&bad_socket, &dir, &shutdown);
+        assert!(
+            result.is_err(),
+            "an unbindable socket must make run_monitor return Err, not block"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `run_monitor` returns `Ok(())` immediately when `shutdown` is ALREADY
+    /// true: the server loop checks the flag at the top of each iteration before
+    /// polling, so a pre-set shutdown short-circuits cleanly. Exercises the
+    /// `server.run(...)` Ok path (monitor.rs 226) without a real crash.
+    #[test]
+    fn run_monitor_returns_ok_when_shutdown_already_set() {
+        let dir = std::env::temp_dir().join(format!(
+            "w1tn3ss-run-monitor-shutdown-{}",
+            std::process::id()
+        ));
+        // shutdown already requested.
+        let shutdown = AtomicBool::new(true);
+        // A unique short socket name avoids colliding with the default name used
+        // by any concurrent test; the bind succeeds, then the pre-set shutdown
+        // short-circuits the loop on its first iteration.
+        let socket = format!("w1tn3ss-shutdown-{}", std::process::id());
+        let result = run_monitor(&socket, &dir, &shutdown);
+        assert!(
+            result.is_ok(),
+            "a pre-set shutdown must let run_monitor return Ok immediately"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `request_shutdown` flips the shared `AtomicBool` to `true` (monitor.rs
+    /// 230-232).
+    #[test]
+    fn request_shutdown_sets_the_flag() {
+        let flag = AtomicBool::new(false);
+        request_shutdown(&flag);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "request_shutdown must set the flag true"
+        );
+    }
 }

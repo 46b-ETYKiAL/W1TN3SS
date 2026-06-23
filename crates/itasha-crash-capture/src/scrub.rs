@@ -262,13 +262,20 @@ pub fn scrub_minidump_in_place(buf: &mut [u8]) -> Result<ScrubReport, ScrubError
 /// `MINIDUMP_MODULE` records. The `module_name_rva` points to a UTF-16LE
 /// length-prefixed string (`u32` byte-length, then the UTF-16 code units).
 fn coarsen_module_list(buf: &mut [u8], rva: usize, data_size: usize) -> u32 {
-    // The stream must at least hold the u32 count.
+    // The stream must at least hold the u32 count. NOTE: `rva` + `data_size` are
+    // both u32-sourced (≤ ~4 GiB each), so this `checked_add` never overflows
+    // `usize` on a 64-bit target — the `else { return 0 }` arm is a defensive
+    // guard that is structurally unreachable here, kept for 32-bit safety.
     let Some(stream_end) = rva.checked_add(data_size) else {
         return 0;
     };
     if stream_end > buf.len() || data_size < 4 {
         return 0;
     }
+    // `data_size >= 4` and `stream_end <= buf.len()` were just asserted, so
+    // `read_u32_le(buf, rva)` (which needs `rva..rva+4`) always succeeds — the
+    // `else { return 0 }` arm is likewise a defensive, structurally-unreachable
+    // guard on this path.
     let Some(count) = read_u32_le(buf, rva) else {
         return 0;
     };
@@ -276,6 +283,11 @@ fn coarsen_module_list(buf: &mut [u8], rva: usize, data_size: usize) -> u32 {
 
     let mut coarsened = 0u32;
     for i in 0..count {
+        // The `None => break` arm fires only on a `usize` overflow of
+        // `i * MODULE_ENTRY_SIZE` — unreachable for any in-bounds count on a
+        // 64-bit target (the truncated-buffer case is caught by the
+        // `entry_offset + MODULE_ENTRY_SIZE > buf.len()` break below, which IS
+        // exercised by `module_list_with_truncated_entry_breaks_without_coarsening`).
         let entry_offset = match rva
             .checked_add(4)
             .and_then(|base| base.checked_add(i.checked_mul(MODULE_ENTRY_SIZE)?))
@@ -317,6 +329,11 @@ fn coarsen_module_name_to_basename(buf: &mut [u8], name_rva: usize) {
     }
     let units = byte_len / 2;
     let data_start = name_rva + 4;
+    // `data_start` and `byte_len` are both u32-derived (≤ ~4 GiB), so this
+    // `checked_add` cannot overflow `usize` on a 64-bit target — the
+    // `else { return }` arm is a defensive guard kept for 32-bit safety, not
+    // reachable on this path. The `data_end > buf.len()` OOB guard below IS
+    // exercised by `module_name_out_of_bounds_length_is_left_untouched`.
     let Some(data_end) = data_start.checked_add(byte_len) else {
         return;
     };
@@ -620,5 +637,243 @@ mod tests {
     fn contains_utf16(buf: &[u8], s: &str) -> bool {
         let needle: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         contains_subslice(buf, &needle)
+    }
+
+    // ---- ScrubError Display (scrub.rs 114-119) ----
+
+    #[test]
+    fn scrub_error_display_strings_are_distinct_and_descriptive() {
+        assert_eq!(
+            format!("{}", ScrubError::TooShort),
+            "buffer too short for a minidump header"
+        );
+        assert_eq!(
+            format!("{}", ScrubError::BadSignature),
+            "not a minidump (bad signature)"
+        );
+        assert_eq!(
+            format!("{}", ScrubError::DirectoryOutOfBounds),
+            "minidump stream directory out of bounds"
+        );
+        // The error implements std::error::Error (source defaults to None).
+        let e: &dyn std::error::Error = &ScrubError::TooShort;
+        assert!(e.source().is_none());
+    }
+
+    /// A directory `rva` past the end of the buffer is rejected as
+    /// `DirectoryOutOfBounds` (the `dir_end > buf.len()` guard), exercising the
+    /// Display arm via a real parse error too.
+    #[test]
+    fn directory_rva_past_buffer_is_directory_out_of_bounds() {
+        let mut dump = build_minidump(&[(MDStreamType::ThreadListStream as u32, b"x".to_vec())]);
+        // Point the directory rva far past the buffer end.
+        write_u32_le(&mut dump, 12, 1_000_000);
+        let err = scrub_minidump_in_place(&mut dump).unwrap_err();
+        assert_eq!(err, ScrubError::DirectoryOutOfBounds);
+    }
+
+    // ---- identifying-stream payload zeroing (scrub.rs 228-235) ----
+
+    /// An identifying stream whose declared location is OUT OF BOUNDS is still
+    /// neutralized at the directory level, but NO payload is zeroed (the
+    /// in-bounds guard at 228-229 is false), so `bytes_zeroed` stays 0 while
+    /// `streams_dropped` increments. This pins the in-bounds branch's negative
+    /// arm.
+    #[test]
+    fn identifying_stream_with_oob_payload_is_neutralized_without_zeroing() {
+        let mut dump =
+            build_minidump(&[(MDStreamType::LinuxEnviron as u32, b"USER=jane\0".to_vec())]);
+        // Corrupt the single entry's rva to point past the buffer; keep its
+        // data_size non-zero so the `checked_add` succeeds but `end > buf.len()`.
+        let dir_off = HEADER_SIZE;
+        write_u32_le(&mut dump, dir_off + 8, 1_000_000); // rva far past end
+        let report = scrub_minidump_in_place(&mut dump).unwrap();
+        assert_eq!(report.streams_dropped, 1);
+        assert_eq!(
+            report.bytes_zeroed, 0,
+            "an out-of-bounds payload location must not zero any bytes"
+        );
+        // The directory entry is still neutralized to the sentinel.
+        assert_eq!(
+            read_u32_le(&dump, dir_off).unwrap(),
+            DROPPED_STREAM_SENTINEL
+        );
+    }
+
+    // ---- coarsen_module_list guards (scrub.rs 266-287) ----
+
+    /// A `ModuleListStream` shorter than the 4-byte count header (`data_size < 4`)
+    /// coarsens ZERO modules (the early `data_size < 4` return at scrub.rs 269).
+    #[test]
+    fn module_list_too_short_for_count_coarsens_nothing() {
+        let mut dump = build_minidump(&[(MDStreamType::ModuleListStream as u32, vec![0u8, 0, 0])]); // 3 bytes < 4
+        let report = scrub_minidump_in_place(&mut dump).unwrap();
+        assert_eq!(report.modules_coarsened, 0);
+    }
+
+    /// A `ModuleListStream` whose count claims more fixed-size module entries
+    /// than the stream actually holds breaks out of the per-entry loop at the
+    /// first entry that would read past the buffer (scrub.rs 286-287), coarsening
+    /// zero modules.
+    #[test]
+    fn module_list_with_truncated_entry_breaks_without_coarsening() {
+        // count = 1, but no room for a full 108-byte MINIDUMP_MODULE after it.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&1u32.to_le_bytes());
+        stream.extend_from_slice(&[0u8; 10]); // far short of MODULE_ENTRY_SIZE
+        let mut dump = build_minidump(&[(MDStreamType::ModuleListStream as u32, stream)]);
+        let report = scrub_minidump_in_place(&mut dump).unwrap();
+        assert_eq!(
+            report.modules_coarsened, 0,
+            "a truncated module entry must break the loop, coarsening nothing"
+        );
+    }
+
+    /// A `ModuleListStream` with `count == 0` coarsens nothing but is still
+    /// counted as a module-list stream (the loop body never runs).
+    #[test]
+    fn module_list_with_zero_count_coarsens_nothing() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&0u32.to_le_bytes()); // count = 0
+        let mut dump = build_minidump(&[(MDStreamType::ModuleListStream as u32, stream)]);
+        let report = scrub_minidump_in_place(&mut dump).unwrap();
+        assert_eq!(report.modules_coarsened, 0);
+    }
+
+    // ---- coarsen_module_name_to_basename guards (scrub.rs 310-342) ----
+
+    /// Helper: build a dump with one module whose name_rva points at the supplied
+    /// length-prefixed UTF-16 name bytes (placed in a second stream), returning
+    /// the dump + the name string's rva so a test can assert on the result.
+    fn dump_with_module_name(name_bytes: Vec<u8>) -> (Vec<u8>, usize) {
+        let mut module_entry = vec![0u8; MODULE_ENTRY_SIZE];
+        write_u32_le(&mut module_entry, MODULE_CHECKSUM_OFFSET, 0xDEAD_BEEF);
+        let mut module_stream = Vec::new();
+        module_stream.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        module_stream.extend_from_slice(&module_entry);
+
+        let mut dump = build_minidump(&[
+            (MDStreamType::ModuleListStream as u32, module_stream),
+            (MDStreamType::ThreadNamesStream as u32, name_bytes),
+        ]);
+        let dir_rva = HEADER_SIZE;
+        let name_dir_off = dir_rva + DIRECTORY_ENTRY_SIZE;
+        let name_rva = read_u32_le(&dump, name_dir_off + 8).unwrap() as usize;
+        let module_stream_rva = read_u32_le(&dump, dir_rva + 8).unwrap() as usize;
+        let module_entry_off = module_stream_rva + 4;
+        write_u32_le(
+            &mut dump,
+            module_entry_off + MODULE_NAME_RVA_OFFSET,
+            name_rva as u32,
+        );
+        (dump, name_rva)
+    }
+
+    /// A module name with `byte_len == 0` is left untouched (scrub.rs 315): the
+    /// module is still counted coarsened (PE fields zeroed) but the empty name
+    /// short-circuits before any shift.
+    #[test]
+    fn module_name_zero_length_is_left_untouched() {
+        let name_bytes = 0u32.to_le_bytes().to_vec(); // byte_len = 0, no units
+        let (mut dump, name_rva) = dump_with_module_name(name_bytes);
+        let report = scrub_minidump_in_place(&mut dump).unwrap();
+        assert_eq!(report.modules_coarsened, 1);
+        assert_eq!(read_u32_le(&dump, name_rva).unwrap(), 0, "byte_len stays 0");
+    }
+
+    /// A module name with an ODD `byte_len` (not a whole number of UTF-16 code
+    /// units) is left untouched (scrub.rs 315 `byte_len % 2 != 0`).
+    #[test]
+    fn module_name_odd_byte_len_is_left_untouched() {
+        let mut name_bytes = 3u32.to_le_bytes().to_vec(); // odd byte_len = 3
+        name_bytes.extend_from_slice(&[b'a', 0, b'b']); // 3 trailing bytes
+        let (mut dump, name_rva) = dump_with_module_name(name_bytes);
+        let report = scrub_minidump_in_place(&mut dump).unwrap();
+        assert_eq!(report.modules_coarsened, 1);
+        // The odd-length name field is unchanged (byte_len still 3).
+        assert_eq!(read_u32_le(&dump, name_rva).unwrap(), 3);
+    }
+
+    /// A module name whose declared `byte_len` runs PAST the end of the buffer is
+    /// left untouched (scrub.rs 323 `data_end > buf.len()`): no shift, no panic.
+    #[test]
+    fn module_name_out_of_bounds_length_is_left_untouched() {
+        // byte_len claims 1000 bytes but only a few follow.
+        let mut name_bytes = 1000u32.to_le_bytes().to_vec();
+        name_bytes.extend_from_slice(&[b'a', 0, b'b', 0]); // a tiny real tail
+        let (mut dump, _name_rva) = dump_with_module_name(name_bytes);
+        // Must not panic; the OOB name is skipped.
+        let report = scrub_minidump_in_place(&mut dump).unwrap();
+        assert_eq!(report.modules_coarsened, 1);
+    }
+
+    /// A module whose `module_name_rva` points so close to the END of the buffer
+    /// that the 4-byte length prefix cannot even be read makes `read_u32_le`
+    /// return `None` (the early-return arm of `coarsen_module_name_to_basename`):
+    /// the name is left untouched, no panic, and the module is still counted as
+    /// coarsened (its PE fields were zeroed before the name step).
+    #[test]
+    fn module_name_rva_with_unreadable_length_prefix_is_left_untouched() {
+        let mut module_entry = vec![0u8; MODULE_ENTRY_SIZE];
+        write_u32_le(&mut module_entry, MODULE_CHECKSUM_OFFSET, 0xDEAD_BEEF);
+        let mut module_stream = Vec::new();
+        module_stream.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        module_stream.extend_from_slice(&module_entry);
+        let mut dump = build_minidump(&[(MDStreamType::ModuleListStream as u32, module_stream)]);
+
+        // Point module_name_rva at `buf.len() - 2` so a 4-byte read is OOB.
+        let dir_rva = HEADER_SIZE;
+        let module_stream_rva = read_u32_le(&dump, dir_rva + 8).unwrap() as usize;
+        let module_entry_off = module_stream_rva + 4;
+        let oob_name_rva = (dump.len() - 2) as u32;
+        write_u32_le(
+            &mut dump,
+            module_entry_off + MODULE_NAME_RVA_OFFSET,
+            oob_name_rva,
+        );
+
+        // Must not panic; the unreadable name is skipped, the module still
+        // counts as coarsened (PE fingerprint fields were zeroed).
+        let report = scrub_minidump_in_place(&mut dump).unwrap();
+        assert_eq!(report.modules_coarsened, 1);
+        assert_eq!(
+            read_u32_le(&dump, module_entry_off + MODULE_CHECKSUM_OFFSET).unwrap(),
+            0
+        );
+    }
+
+    /// A module name with NO path separator is already a basename and is left
+    /// unchanged (scrub.rs 338 `last_sep == None`).
+    #[test]
+    fn module_name_without_separator_is_unchanged() {
+        let name_bytes = encode_utf16_lenprefixed("app.dll"); // no '/' or '\\'
+        let (mut dump, name_rva) = dump_with_module_name(name_bytes);
+        scrub_minidump_in_place(&mut dump).unwrap();
+        assert_eq!(decode_utf16_lenprefixed(&dump, name_rva), "app.dll");
+    }
+
+    /// A module name ENDING in a path separator (`base_start_unit >= units`) is
+    /// left as-is (scrub.rs 342 trailing-separator guard).
+    #[test]
+    fn module_name_with_trailing_separator_is_left_as_is() {
+        let name_bytes = encode_utf16_lenprefixed("C:\\Users\\jane\\"); // trailing '\\'
+        let (mut dump, name_rva) = dump_with_module_name(name_bytes);
+        scrub_minidump_in_place(&mut dump).unwrap();
+        // Unchanged: the trailing-separator case does not shift.
+        assert_eq!(
+            decode_utf16_lenprefixed(&dump, name_rva),
+            "C:\\Users\\jane\\"
+        );
+    }
+
+    /// A forward-slash separated path coarsens to its basename too (the `/` arm
+    /// of the separator match), complementing the existing back-slash test.
+    #[test]
+    fn module_name_forward_slash_path_coarsens_to_basename() {
+        let name_bytes = encode_utf16_lenprefixed("/usr/lib/jane/libfoo.so");
+        let (mut dump, name_rva) = dump_with_module_name(name_bytes);
+        scrub_minidump_in_place(&mut dump).unwrap();
+        assert_eq!(decode_utf16_lenprefixed(&dump, name_rva), "libfoo.so");
+        assert!(!contains_utf16(&dump, "jane"));
     }
 }

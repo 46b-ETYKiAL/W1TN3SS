@@ -68,6 +68,52 @@ jobs:
         run: cargo test --all --locked
 
   # ---------------------------------------------------------------------------
+  # coverage: line-coverage floor. cargo-llvm-cov over the workspace must clear
+  # the --fail-under-lines floor. Structurally-uncoverable surfaces (the live
+  # Tor onion bootstrap/connect, the native out-of-process minidump capture, and
+  # the monitor binary entry point) are excluded by --ignore-filename-regex and
+  # documented in docs/adr-0002-coverage-floor-and-exclusions.md. The floor is
+  # measured WITH those exclusions, so it gates the *testable* surface.
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: llvm-cov (line-coverage floor)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain (stable + llvm-tools)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov + cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      - name: Cache cargo registry + git + build
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-cov-
+
+      # The exclusion regex covers the three structurally-uncoverable surfaces.
+      # See docs/adr-0002-coverage-floor-and-exclusions.md for the full rationale
+      # and the per-file justification.
+      - name: cargo llvm-cov (workspace, fail-under-lines floor)
+        run: |
+          cargo llvm-cov nextest \
+            --all-features --workspace --locked \
+            --ignore-filename-regex '(crash-capture[\\/]src[\\/](client|bin[\\/]monitor)\.rs|transport-tor[\\/]src[\\/]transport\.rs)' \
+            --fail-under-lines 95
+
+  # ---------------------------------------------------------------------------
   # gitleaks: secret-scanning gate. We install the OSS binary directly rather
   # than gitleaks/gitleaks-action@v2 — the action requires a GITLEAKS_LICENSE
   # for organization repos and pins a Node version slated for removal. The

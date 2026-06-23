@@ -113,6 +113,14 @@ pub fn run_monitor_main(args: impl IntoIterator<Item = String>) -> i32 {
             .into_owned()
     });
     let shutdown = std::sync::atomic::AtomicBool::new(false);
+    // The `Err(_e) => 1` arm is unit-tested via an unbindable socket (see the
+    // tests below). The `Ok(()) => 0` arm is NOT directly unit-testable: this
+    // entry point constructs its own `shutdown=false` and then blocks in
+    // `run_monitor`'s server loop until a real OS crash drives the handler to
+    // `LoopAction::Exit`, so a clean `Ok` return requires either a genuine
+    // native fault or an externally-set shutdown that this signature does not
+    // expose. The `Ok` path of the underlying `run_monitor` IS covered directly
+    // in `monitor::tests::run_monitor_returns_ok_when_shutdown_already_set`.
     match run_monitor(&socket, config_dir, &shutdown) {
         Ok(()) => 0,
         Err(_e) => 1,
@@ -164,5 +172,48 @@ mod tests {
     fn crate_name_and_version_are_set() {
         assert_eq!(CRATE_NAME, "itasha-crash-capture");
         assert!(!CRATE_VERSION.is_empty());
+    }
+
+    /// A socket name that deterministically fails `minidumper::Server::with_name`
+    /// WITHOUT binding any real OS resource or blocking. minidumper copies the
+    /// path into a fixed 108-byte `sockaddr_un.sun_path`; a longer-than-107-byte
+    /// path is rejected with `InvalidData` on every platform before any
+    /// socket/pipe syscall, so `run_monitor` returns `Err` immediately.
+    fn unbindable_socket_name() -> String {
+        format!("w1tn3ss-{}", "x".repeat(200))
+    }
+
+    /// `run_monitor_main` returns exit code 1 when the underlying `run_monitor`
+    /// fails. We force a fast `Err` with an over-long socket name (rejected
+    /// before any blocking server loop), so the server never starts. Exercises
+    /// the `Err(_e) => 1` arm and the `--config-dir` default branch (no
+    /// `--config-dir` passed → lib.rs 109-114).
+    #[test]
+    fn run_monitor_main_returns_one_on_run_error() {
+        let argv = vec![
+            "w1tn3ss-crash-monitor".to_string(),
+            "--socket".to_string(),
+            unbindable_socket_name(),
+        ];
+        let code = run_monitor_main(argv);
+        assert_eq!(code, 1, "an invalid socket must yield exit code 1");
+    }
+
+    /// `run_monitor_main` honours an explicit `--config-dir` (the non-default
+    /// branch). We still force a fast error via an unbindable socket so the call
+    /// returns without blocking; the assertion is on the exit code.
+    #[test]
+    fn run_monitor_main_uses_explicit_config_dir_and_reports_error() {
+        let cfg =
+            std::env::temp_dir().join(format!("w1tn3ss-run-monitor-cfg-{}", std::process::id()));
+        let argv = vec![
+            "w1tn3ss-crash-monitor".to_string(),
+            "--socket".to_string(),
+            unbindable_socket_name(),
+            "--config-dir".to_string(),
+            cfg.to_string_lossy().into_owned(),
+        ];
+        let code = run_monitor_main(argv);
+        assert_eq!(code, 1);
     }
 }

@@ -296,4 +296,225 @@ mod tests {
             SendOutcome::Sent => panic!("stub must not claim Sent"),
         }
     }
+
+    #[test]
+    fn send_error_display_renders_both_arms() {
+        // PayloadTooLarge arm (lines 56-58): the message names the actual + cap.
+        let too_large = SendError::PayloadTooLarge {
+            actual: 9_000,
+            cap: 8_000,
+        };
+        let s = format!("{too_large}");
+        assert_eq!(s, "payload 9000 bytes exceeds cap 8000 bytes");
+
+        // Transport arm (line 59): the message carries the inner reason.
+        let transport = SendError::Transport("connection refused".to_string());
+        assert_eq!(
+            format!("{transport}"),
+            "transport error: connection refused"
+        );
+    }
+
+    #[test]
+    fn send_error_implements_std_error_trait() {
+        // Exercise the std::error::Error impl (line 64) through a trait object so
+        // `source()`/`Display` are reachable as an error value.
+        let err = SendError::Transport("x".to_string());
+        let dyn_err: &dyn std::error::Error = &err;
+        assert!(dyn_err.to_string().starts_with("transport error:"));
+        assert!(dyn_err.source().is_none());
+    }
+
+    #[test]
+    fn with_timeout_overrides_the_timeout() {
+        // with_timeout (lines 90-93) returns a config with the new timeout and
+        // leaves the other fields intact.
+        let cfg =
+            TransportConfig::new("https://x.invalid/").with_timeout(Duration::from_millis(250));
+        assert_eq!(cfg.timeout, Duration::from_millis(250));
+        assert_eq!(cfg.endpoint, "https://x.invalid/");
+        // Default max payload is preserved by the builder.
+        assert_eq!(cfg.max_payload_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn lean_send_to_closed_port_returns_failed_not_err() {
+        // send() (lines 158-171) builds the hardened agent (lines 129-136) and
+        // POSTs. Pointing at a closed local port makes ureq return Err, which the
+        // backend maps to Ok(SendOutcome::Failed(reason)) — never a panic, never
+        // a fake Sent. Port 1 is the well-known unroutable/closed port.
+        let backend = LeanPipelineBackend::new(
+            TransportConfig::new("http://127.0.0.1:1/").with_timeout(Duration::from_millis(500)),
+        );
+        let report = Report::crash("panic at <HOME>/x.rs:1");
+        let consent = ConsentToken::granted();
+        let outcome = backend.send(&report, &consent).unwrap();
+        match outcome {
+            SendOutcome::Failed(reason) => {
+                // The reason is non-identifying: it carries no URL/host, only a
+                // transport-class token from transport_reason().
+                assert!(!reason.contains("127.0.0.1"), "endpoint leaked: {reason}");
+                assert!(!reason.is_empty());
+            }
+            SendOutcome::Sent => panic!("a send to a closed port must not claim Sent"),
+        }
+    }
+
+    #[test]
+    fn lean_send_oversize_payload_is_payload_too_large_before_network() {
+        // The size cap is enforced in build_payload before any network touch, so
+        // send() surfaces PayloadTooLarge (the early-return at line 159 via `?`).
+        let backend = LeanPipelineBackend::new(
+            TransportConfig::new("http://127.0.0.1:1/").with_max_payload_bytes(8),
+        );
+        let report = Report::crash("x".repeat(10_000));
+        let consent = ConsentToken::granted();
+        let err = backend.send(&report, &consent).unwrap_err();
+        match err {
+            SendError::PayloadTooLarge { actual, cap } => {
+                assert!(actual > cap);
+                assert_eq!(cap, 8);
+            }
+            SendError::Transport(_) => panic!("oversize must fail before the network"),
+        }
+    }
+
+    #[test]
+    fn sentry_stub_oversize_payload_is_payload_too_large() {
+        // SentryStubBackend::send (lines 199-202): the same size cap is enforced
+        // on the stub path, proving wire-format parity for the reject case.
+        let stub = SentryStubBackend::new(
+            TransportConfig::new("https://sentry.invalid/").with_max_payload_bytes(16),
+        );
+        let report = Report::crash("y".repeat(50_000));
+        let consent = ConsentToken::granted();
+        let err = stub.send(&report, &consent).unwrap_err();
+        match err {
+            SendError::PayloadTooLarge { actual, cap } => {
+                assert!(actual > 16);
+                assert_eq!(cap, 16);
+            }
+            SendError::Transport(_) => panic!("stub oversize must be PayloadTooLarge"),
+        }
+    }
+
+    #[test]
+    fn transport_reason_maps_status_code_arm() {
+        // transport_reason (lines 230-231): a real HTTP error status maps to the
+        // non-identifying "http status {code}" token. We stand up a one-shot
+        // local server that returns 500, point the backend at it, and assert the
+        // Failed reason names the status class (and never the host/URL).
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Fully drain the client's request (headers + Content-Length body)
+                // BEFORE replying. A partial read (e.g. a single fixed buffer) lets
+                // the server close mid-write, which ureq surfaces as a generic
+                // transport/IO error instead of a clean StatusCode(500) — the
+                // flaky failure this drain fixes. We read until we have seen the
+                // end-of-headers and consumed the declared body length.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut content_length: Option<usize> = None;
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            raw.extend_from_slice(&chunk[..n]);
+                            if content_length.is_none() {
+                                if let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                                {
+                                    let head = String::from_utf8_lossy(&raw[..hdr_end]);
+                                    content_length = head
+                                        .lines()
+                                        .find_map(|l| {
+                                            let (k, v) = l.split_once(':')?;
+                                            k.trim()
+                                                .eq_ignore_ascii_case("content-length")
+                                                .then(|| v.trim().parse::<usize>().ok())
+                                                .flatten()
+                                        })
+                                        .or(Some(0));
+                                }
+                            }
+                            if let Some(clen) = content_length {
+                                if let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                                {
+                                    if raw.len() >= hdr_end + 4 + clen {
+                                        break; // full request drained
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => break, // timeout/closed — drained what we could
+                    }
+                }
+                let body = "err";
+                let resp = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let backend = LeanPipelineBackend::new(
+            TransportConfig::new(format!("http://127.0.0.1:{port}/"))
+                .with_timeout(Duration::from_secs(5)),
+        );
+        let report = Report::crash("panic");
+        let consent = ConsentToken::granted();
+        let outcome = backend.send(&report, &consent).unwrap();
+        handle.join().ok();
+        match outcome {
+            SendOutcome::Failed(reason) => {
+                // ureq 3.x defaults to http_status_as_error, so a 500 surfaces as
+                // Error::StatusCode → "http status 500".
+                assert_eq!(reason, "http status 500", "got: {reason}");
+                assert!(!reason.contains("127.0.0.1"), "host leaked: {reason}");
+            }
+            SendOutcome::Sent => panic!("a 500 response must not claim Sent"),
+        }
+    }
+
+    #[test]
+    fn transport_reason_maps_timeout_arm() {
+        // transport_reason (line 232): a server that accepts the connection but
+        // never responds trips the global timeout, which maps to the typeless
+        // "timeout" token. A very short with_timeout makes this deterministic.
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            // Accept and then hold the connection open without replying so the
+            // client's global timeout fires.
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(800));
+                drop(stream);
+            }
+        });
+
+        let backend = LeanPipelineBackend::new(
+            TransportConfig::new(format!("http://127.0.0.1:{port}/"))
+                .with_timeout(Duration::from_millis(150)),
+        );
+        let report = Report::crash("panic");
+        let consent = ConsentToken::granted();
+        let outcome = backend.send(&report, &consent).unwrap();
+        handle.join().ok();
+        match outcome {
+            SendOutcome::Failed(reason) => {
+                assert_eq!(reason, "timeout", "expected a timeout class, got: {reason}");
+            }
+            SendOutcome::Sent => panic!("a stalled server must not claim Sent"),
+        }
+    }
 }

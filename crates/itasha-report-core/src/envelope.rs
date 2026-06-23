@@ -474,4 +474,63 @@ mod tests {
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
+
+    #[test]
+    fn envelope_error_display_renders_both_arms() {
+        // EnvelopeError Display (lines 69-74): the Malformed arm names the detail.
+        let malformed = EnvelopeError::Malformed("missing newline".into());
+        assert_eq!(
+            format!("{malformed}"),
+            "malformed envelope: missing newline"
+        );
+        let dyn_err: &dyn std::error::Error = &malformed;
+        assert!(dyn_err.to_string().starts_with("malformed envelope:"));
+
+        // The Json arm: a real serde_json error wraps via From (lines 80-82) and
+        // formats with the "envelope json error:" prefix.
+        let json_err: serde_json::Error = serde_json::from_str::<EnvelopeHeader>("{").unwrap_err();
+        let wrapped: EnvelopeError = json_err.into();
+        let shown = format!("{wrapped}");
+        assert!(shown.starts_with("envelope json error:"), "got: {shown}");
+        match wrapped {
+            EnvelopeError::Json(_) => {}
+            EnvelopeError::Malformed(_) => panic!("From must yield the Json variant"),
+        }
+    }
+
+    #[test]
+    fn manual_issue_event_level_is_info() {
+        // from_report (line 127): a ManualIssues-stream report serializes the
+        // event `level` as "info" (the crash path is "error"). This exercises the
+        // ManualIssues match arm that the crash-only tests never reached.
+        let report = Report::manual_issue("feedback", "the button is misaligned");
+        let env = Envelope::from_report(&report, None);
+        let wire = String::from_utf8(env.to_bytes()).unwrap();
+        assert!(wire.contains("\"level\":\"info\""), "got: {wire}");
+        assert!(!wire.contains("\"level\":\"error\""));
+    }
+
+    #[test]
+    fn from_bytes_rejects_item_length_exceeding_buffer() {
+        // from_bytes (lines 254-258): an item header claiming a payload longer
+        // than the remaining bytes is malformed and errors (never panics / never
+        // over-reads).
+        let bytes = b"{}\n{\"type\":\"event\",\"length\":9999}\nshort";
+        let err = Envelope::from_bytes(bytes).unwrap_err();
+        match err {
+            EnvelopeError::Malformed(m) => {
+                assert!(m.contains("exceeds remaining bytes"), "got: {m}");
+            }
+            EnvelopeError::Json(_) => panic!("expected a Malformed length error"),
+        }
+    }
+
+    #[test]
+    fn from_bytes_handles_missing_item_header_newline() {
+        // from_bytes: an item region with no terminating newline after the header
+        // is malformed (the `position(... '\n')` ok_or path).
+        let bytes = b"{}\n{\"type\":\"event\",\"length\":0}";
+        let err = Envelope::from_bytes(bytes).unwrap_err();
+        assert!(matches!(err, EnvelopeError::Malformed(_)));
+    }
 }

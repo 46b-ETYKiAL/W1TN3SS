@@ -153,6 +153,29 @@ mod tests {
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    /// `spool_minidump` propagates a `SpoolError` when the spool cannot be
+    /// opened (emit.rs 68): pointing `config_dir` at a regular FILE makes
+    /// `Spool::open`'s `create_dir_all("<file>/reports")` fail, so the `?` on the
+    /// `Spool::open` line returns the error rather than spooling.
+    #[test]
+    fn spool_minidump_propagates_spool_open_error() {
+        let base = std::env::temp_dir().join(format!(
+            "w1tn3ss-emit-openfail-{}-{}",
+            std::process::id(),
+            crate::consent::Tier2ConsentToken::granted().nonce()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let config_file = base.join("config-is-a-file");
+        std::fs::write(&config_file, b"not a directory").unwrap();
+
+        let result = spool_minidump(&config_file, vec![1, 2, 3], &[]);
+        assert!(
+            result.is_err(),
+            "spooling under a non-directory config path must error, not panic"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn envelope_round_trips_with_minidump_attachment() {
         let dump = vec![0u8, b'\n', 7, b'\n', 200, b'\n']; // newlines in binary

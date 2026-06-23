@@ -608,6 +608,99 @@ mod tests {
     }
 
     #[test]
+    fn is_safe_shape_blank_line_is_safe() {
+        // is_safe_shape (lines 303-305): a blank/whitespace-only line is safe and
+        // preserves backtrace readability.
+        assert!(is_safe_shape(""));
+        assert!(is_safe_shape("    "));
+    }
+
+    #[test]
+    fn is_safe_shape_rejects_unnormalized_home_paths() {
+        // is_safe_shape (lines 309-310 → contains_unnormalized_home): any residual
+        // identity-bearing path segment fails the allowlist outright.
+        assert!(!is_safe_shape("at /home/bob/x.rs:1"));
+        assert!(!is_safe_shape("C:\\Users\\bob\\x.rs"));
+        assert!(!is_safe_shape("from /Users/bob/app"));
+        assert!(!is_safe_shape("at /root/secret"));
+    }
+
+    #[test]
+    fn is_safe_shape_accepts_frame_symbol_and_location_and_panic_header() {
+        // Frame symbol line (line 315).
+        assert!(is_safe_shape("  3: core::panicking::panic_fmt"));
+        // Normalized location with HOME placeholder (line 320-321).
+        assert!(is_safe_shape("at <HOME>/src/main.rs:12:5"));
+        // Relative location (the !starts_with('/') branch of is_normalized_location_line).
+        assert!(is_safe_shape("at src/main.rs:1"));
+        // Normalized panic header (lines 324-326).
+        assert!(is_safe_shape("thread 'main' panicked at <HOME>/m.rs:1"));
+    }
+
+    #[test]
+    fn is_safe_shape_generic_prose_with_no_markers_is_kept() {
+        // is_safe_shape (line 330): short prose with no '/', '\\', or '@' passes
+        // the final generic-prose guard.
+        assert!(is_safe_shape("note: run with RUST_BACKTRACE=1"));
+        // Prose with no leading '/' is accepted by the relative-location branch
+        // (is_normalized_location_line, line 364: !body.starts_with('/')) BEFORE
+        // the final separator guard is reached — so a URL-bearing non-absolute
+        // line is kept. The allowlist's identity defense is contains_unnormalized_home
+        // (home/users/root segments), NOT a blanket '/'-rejection.
+        assert!(is_safe_shape("see http://x/y for info"));
+        // An '@'-bearing line with no leading '/' is likewise accepted by the
+        // relative-location branch; '@' alone is not an identity marker here.
+        assert!(is_safe_shape("contact a@b"));
+        // The final generic-prose guard (line 330) only governs lines that are
+        // NOT relative locations — e.g. a line that begins with '/': it is not a
+        // frame line, not a HOME-placeholder line, body starts with '/', so the
+        // relative-location branch is false and the '/'-containing final guard
+        // rejects it.
+        assert!(!is_safe_shape("/opt/app/relative note"));
+    }
+
+    #[test]
+    fn disallowed_shape_line_collapses_to_redacted_marker() {
+        // scrub_line (line 273): a line that fails the allowlist after redaction
+        // collapses wholesale to REDACTED_MARKER. A bare unrecognized-shape line
+        // with an identity-bearing path survives free-text redaction but fails
+        // is_safe_shape → whole line becomes the marker.
+        let s = sanitizer();
+        let out = s.scrub_backtrace("weird line with C:\\Users\\stranger\\thing");
+        assert!(
+            out.contains(REDACTED_MARKER) || out.contains(crate::redact::PATH_DROP),
+            "disallowed-shape line not collapsed: {out}"
+        );
+        assert!(!out.contains("stranger"), "foreign identity leaked: {out}");
+    }
+
+    #[test]
+    fn replace_path_prefixes_handles_windows_backslash_and_alt_form() {
+        // replace_path_prefixes (lines 369-381, esp. 371 alt branch): a Windows
+        // home is replaced in BOTH its backslash form and a forward-slash alt.
+        let home = "C:\\Users\\ada";
+        let bs = replace_path_prefixes("at C:\\Users\\ada\\m.rs", home, HOME_PLACEHOLDER);
+        assert_eq!(bs, "at <HOME>\\m.rs");
+        let fs = replace_path_prefixes("at C:/Users/ada/m.rs", home, HOME_PLACEHOLDER);
+        assert_eq!(fs, "at <HOME>/m.rs");
+        // Empty home is a no-op (the early return).
+        assert_eq!(
+            replace_path_prefixes("unchanged", "", HOME_PLACEHOLDER),
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn replace_token_empty_token_is_noop_and_respects_word_boundaries() {
+        // replace_token (line 388): an empty token returns the haystack unchanged.
+        assert_eq!(replace_token("hello", "", "<X>"), "hello");
+        // Word-boundary discipline (line 403 advance branch): a token embedded in a
+        // larger identifier is NOT replaced, only the standalone occurrence is.
+        let out = replace_token("ada adamant ada_x ada", "ada", "<USER>");
+        assert_eq!(out, "<USER> adamant ada_x <USER>");
+    }
+
+    #[test]
     fn redaction_token_carries_no_type_or_count() {
         // The uniform redaction token must reveal neither the TYPE nor the COUNT
         // of what was redacted (both are quasi-identifiers).
