@@ -33,7 +33,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use minidumper::{LoopAction, MinidumpBinary, Server, ServerHandler};
 
@@ -75,8 +75,11 @@ pub struct MonitorHandler {
     policy: MinidumpPolicy,
     /// Where the temp minidump file is written before being read + spooled.
     dump_dir: PathBuf,
-    /// Captured outcomes (a Mutex so the `&self` handler can record results).
-    outcomes: Mutex<Vec<CaptureOutcome>>,
+    /// Captured outcomes. Shared behind an `Arc<Mutex<_>>` so the monitor PROCESS
+    /// can drain results AFTER `minidumper::Server::run` has consumed the boxed
+    /// handler — the seam that lets fail-closed outcomes reach the host instead
+    /// of being computed-then-discarded (LOG-WS-001).
+    outcomes: Arc<Mutex<Vec<CaptureOutcome>>>,
 }
 
 impl MonitorHandler {
@@ -90,7 +93,7 @@ impl MonitorHandler {
             config_dir,
             policy: MinidumpPolicy::Minimized,
             dump_dir,
-            outcomes: Mutex::new(Vec::new()),
+            outcomes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -107,6 +110,16 @@ impl MonitorHandler {
     pub fn take_outcomes(&self) -> Vec<CaptureOutcome> {
         let mut guard = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
         std::mem::take(&mut guard)
+    }
+
+    /// A shared handle to the outcome sink. [`run_monitor`] keeps a clone of this
+    /// BEFORE the handler is boxed and consumed by the blocking server loop, so
+    /// the recorded outcomes can be drained and surfaced to the host once the
+    /// loop exits — without this seam the outcomes die with the boxed handler
+    /// (LOG-WS-001).
+    #[must_use]
+    pub fn outcomes_handle(&self) -> Arc<Mutex<Vec<CaptureOutcome>>> {
+        Arc::clone(&self.outcomes)
     }
 
     fn record(&self, outcome: CaptureOutcome) {
@@ -218,7 +231,14 @@ impl ServerHandler for MonitorHandler {
 
 /// Run the monitor server loop on `socket_name`, rooting the spool at
 /// `config_dir`. Blocks until a crash is captured (the handler returns
-/// [`LoopAction::Exit`]) or `shutdown` is set.
+/// [`LoopAction::Exit`]) or `shutdown` is set, then returns the
+/// [`CaptureOutcome`]s the handler recorded during the loop so the caller can
+/// SURFACE them to the host (counts/enums only — never bytes or PII).
+///
+/// The handler is consumed by `minidumper::Server::run`, so the outcomes are
+/// read back through a shared `Arc<Mutex<_>>` handle taken before the box is
+/// moved. An empty `Vec` means the loop exited (e.g. on `shutdown`) without a
+/// capture; a non-empty `Vec` carries the per-capture result(s) (LOG-WS-001).
 ///
 /// # Errors
 ///
@@ -228,10 +248,16 @@ pub fn run_monitor(
     socket_name: &str,
     config_dir: impl Into<PathBuf>,
     shutdown: &AtomicBool,
-) -> Result<(), minidumper::Error> {
+) -> Result<Vec<CaptureOutcome>, minidumper::Error> {
     let mut server = Server::with_name(minidumper::SocketName::path(socket_name))?;
     let handler = MonitorHandler::new(config_dir);
-    server.run(Box::new(handler), shutdown, None)
+    // Clone the shared outcome-sink handle BEFORE the handler is boxed and moved
+    // into the blocking server loop — this is the seam that lets the recorded
+    // outcomes be drained and surfaced to the host after the loop exits.
+    let outcomes = handler.outcomes_handle();
+    server.run(Box::new(handler), shutdown, None)?;
+    let drained = std::mem::take(&mut *outcomes.lock().unwrap_or_else(|p| p.into_inner()));
+    Ok(drained)
 }
 
 /// Signal a running [`run_monitor`] loop to stop at the next poll.
@@ -644,10 +670,41 @@ mod tests {
         // short-circuits the loop on its first iteration.
         let socket = format!("w1tn3ss-shutdown-{}", std::process::id());
         let result = run_monitor(&socket, &dir, &shutdown);
-        assert!(
-            result.is_ok(),
-            "a pre-set shutdown must let run_monitor return Ok immediately"
-        );
+        match result {
+            // A pre-set shutdown exits the loop with no capture, so the drained
+            // outcome vec is empty (exercises the `Ok(drained)` surface seam).
+            Ok(outcomes) => assert!(
+                outcomes.is_empty(),
+                "a no-capture loop must drain an empty outcome vec"
+            ),
+            Err(_) => panic!("a pre-set shutdown must let run_monitor return Ok immediately"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `outcomes_handle` returns a SHARED view of the same sink the handler
+    /// records into: a result recorded after the handle is taken is visible
+    /// through the handle. This is the seam `run_monitor` relies on to drain
+    /// outcomes after the boxed handler is consumed by the server loop.
+    #[test]
+    fn outcomes_handle_shares_the_sink_with_the_handler() {
+        let dir = std::env::temp_dir().join(format!(
+            "w1tn3ss-monitor-handle-{}-{}",
+            std::process::id(),
+            crate::consent::Tier2ConsentToken::granted().nonce()
+        ));
+        let h = MonitorHandler::new(&dir);
+        let handle = h.outcomes_handle();
+        assert!(handle.lock().unwrap().is_empty());
+        // Record through the handler...
+        h.record(CaptureOutcome::CaptureFailed {
+            reason: "A crash report could not be created and was discarded.".to_string(),
+        });
+        // ...and observe it through the shared handle (same underlying Vec).
+        let drained = std::mem::take(&mut *handle.lock().unwrap_or_else(|p| p.into_inner()));
+        assert_eq!(drained.len(), 1);
+        // The handler's own view is now empty (the take drained the shared sink).
+        assert!(h.take_outcomes().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
