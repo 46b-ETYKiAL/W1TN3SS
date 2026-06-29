@@ -31,8 +31,8 @@
 /// code change. It uses consent language ("may contain fragments of your open
 /// documents"), never beacon/telemetry/always-on/tracking wording.
 pub const TIER2_CONSENT_DISCLOSURE: &str =
-    "A crash dump may contain fragments of your open documents. \
-It is stored only on this device and is never sent automatically — you choose whether to send it.";
+    "A crash report may contain fragments of your open documents. \
+It stays on this device and is never sent automatically — you choose whether to send it.";
 
 /// A non-forgeable, non-serializable marker proving the host obtained explicit
 /// **heightened** (Tier-2) user consent for native minidump capture.

@@ -108,10 +108,12 @@ pub fn launch(url: &str) -> Result<(), String> {
     webbrowser::open(url).map_err(|e| map_launch_error(&e))
 }
 
-/// Map a browser-launch failure to a non-identifying message. Pure; carries no
-/// URL or host of ours beyond what the OS error layer surfaces.
-fn map_launch_error(e: &impl std::fmt::Display) -> String {
-    format!("could not open browser: {e}")
+/// Map a browser-launch failure to a plain, non-identifying message with a
+/// recovery step. Pure; the inner OS error is NOT interpolated (it can embed an
+/// errno / path), and the user is told exactly what to do instead.
+fn map_launch_error(_e: &impl std::fmt::Display) -> String {
+    "Could not open your browser. Copy the report text and paste it into a new issue instead."
+        .to_string()
 }
 
 /// Percent-encode a string for a URL query component (RFC 3986). Encodes
@@ -246,10 +248,19 @@ mod tests {
         // map_launch_error is the pure error-mapping half of `launch`. We test it
         // directly — without invoking `webbrowser::open`, which on a desktop would
         // spawn a real browser child process that outlives the test (a leak). The
-        // mapped message is the non-identifying "could not open browser:" form and
-        // carries only what the OS error layer surfaces (here, our synthetic one).
-        let msg = map_launch_error(&"no display server");
-        assert_eq!(msg, "could not open browser: no display server");
-        assert!(msg.starts_with("could not open browser:"));
+        // mapped message is plain copy with a recovery step (WS-029) and carries
+        // NONE of the inner OS error — even when that error embeds an errno/path.
+        let msg = map_launch_error(&"os error 2 at /home/jane/.cache: no display server");
+        assert_eq!(
+            msg,
+            "Could not open your browser. Copy the report text and paste it into a new issue instead."
+        );
+        // REDACTION: no inner OS detail survives.
+        assert!(!msg.contains('/'), "path separator leaked: {msg}");
+        assert!(!msg.contains("os error"), "errno leaked: {msg}");
+        assert!(
+            !msg.contains("display server"),
+            "inner reason leaked: {msg}"
+        );
     }
 }

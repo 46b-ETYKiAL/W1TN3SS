@@ -67,15 +67,17 @@ pub enum StarError {
 }
 
 impl std::fmt::Display for StarError {
+    // Host-visible copy carries no privacy-protocol jargon ("k-anonymity",
+    // "STAR") and no inner library detail / threshold numbers. The values stay
+    // on the variant for a host-side log toggle.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StarError::ThresholdTooLow { k, floor } => {
-                write!(
-                    f,
-                    "k-anonymity threshold {k} is below the hard floor {floor}"
-                )
+            StarError::ThresholdTooLow { .. } => f.write_str(
+                "The anonymity group size is set too low and was rejected; it must be at least the required minimum.",
+            ),
+            StarError::Generate(_) => {
+                f.write_str("The anonymous signal could not be prepared and was not sent.")
             }
-            StarError::Generate(m) => write!(f, "STAR message generation failed: {m}"),
         }
     }
 }
@@ -171,6 +173,41 @@ mod tests {
     use super::*;
     use crate::measurement::AggregateMeasurement;
     use sta_rs::{derive_ske_key, load_bytes, share_recover, Share};
+
+    /// WS-032/033: `StarError` Display carries no privacy-protocol jargon
+    /// ("k-anonymity", "STAR"), no threshold numbers, and no inner library
+    /// detail.
+    #[test]
+    fn star_error_display_is_plain_and_jargon_free() {
+        let too_low = StarError::ThresholdTooLow { k: 2, floor: 5 };
+        let low_shown = format!("{too_low}");
+        assert_eq!(
+            low_shown,
+            "The anonymity group size is set too low and was rejected; it must be at least the required minimum."
+        );
+        let generate = StarError::Generate("sta_rs internal failure 0xdead".to_string());
+        let gen_shown = format!("{generate}");
+        assert_eq!(
+            gen_shown,
+            "The anonymous signal could not be prepared and was not sent."
+        );
+        for shown in [&low_shown, &gen_shown] {
+            let lower = shown.to_lowercase();
+            for jargon in [
+                "k-anonymity",
+                "star",
+                "threshold",
+                "floor",
+                "sta_rs",
+                "0xdead",
+            ] {
+                assert!(
+                    !lower.contains(jargon),
+                    "jargon/inner detail leaked: {shown}"
+                );
+            }
+        }
+    }
 
     fn measurement(sig: &str) -> AggregateMeasurement {
         AggregateMeasurement::new(

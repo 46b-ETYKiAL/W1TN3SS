@@ -25,10 +25,18 @@ pub enum SpoolError {
 }
 
 impl std::fmt::Display for SpoolError {
+    // The inner `io::Error` can embed an OS errno + the local spool path, and the
+    // inner `serde_json::Error` can quote stored content fragments — neither is
+    // ever interpolated here. The inner error stays on the variant for a
+    // host-side log toggle.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpoolError::Io(e) => write!(f, "spool io error: {e}"),
-            SpoolError::Serialize(e) => write!(f, "spool serialize error: {e}"),
+            SpoolError::Io(_) => {
+                f.write_str("A report could not be saved to or read from this device.")
+            }
+            SpoolError::Serialize(_) => {
+                f.write_str("A saved report could not be read; it may be corrupted.")
+            }
         }
     }
 }
@@ -303,22 +311,41 @@ mod tests {
 
     #[test]
     fn spool_error_display_renders_both_arms() {
-        // SpoolError Display (lines 27-33): the Io arm and the Serialize arm each
-        // format with their distinct prefix and the inner error.
+        // WS-027/028: plain copy; the inner io::Error (errno + local spool path)
+        // and serde detail (stored content fragments) are NEVER interpolated.
         let io = SpoolError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "no such file",
+            "no such file /home/jane/.config/app/reports/r.json (os error 2)",
         ));
         let io_shown = format!("{io}");
-        assert!(io_shown.starts_with("spool io error:"), "got: {io_shown}");
-        assert!(io_shown.contains("no such file"));
+        assert_eq!(
+            io_shown,
+            "A report could not be saved to or read from this device."
+        );
+        // REDACTION: no path, no errno, no "spool" identifier.
+        assert!(!io_shown.contains('/'), "path separator leaked: {io_shown}");
+        assert!(!io_shown.contains("os error"), "errno leaked: {io_shown}");
+        assert!(
+            !io_shown.to_lowercase().contains("spool"),
+            "internal 'spool' identifier leaked: {io_shown}"
+        );
         let dyn_io: &dyn std::error::Error = &io;
-        assert!(dyn_io.to_string().starts_with("spool io error:"));
+        assert!(dyn_io
+            .to_string()
+            .starts_with("A report could not be saved"));
 
         // Serialize arm via a real serde_json error.
         let serde_err = serde_json::from_str::<Report>("not json").unwrap_err();
         let ser = SpoolError::Serialize(serde_err);
-        assert!(format!("{ser}").starts_with("spool serialize error:"));
+        let ser_shown = format!("{ser}");
+        assert_eq!(
+            ser_shown,
+            "A saved report could not be read; it may be corrupted."
+        );
+        assert!(
+            !ser_shown.to_lowercase().contains("spool"),
+            "internal identifier leaked: {ser_shown}"
+        );
     }
 
     #[test]

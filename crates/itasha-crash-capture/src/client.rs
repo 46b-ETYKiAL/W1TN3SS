@@ -47,11 +47,23 @@ pub enum ArmError {
 }
 
 impl std::fmt::Display for ArmError {
+    // Host-visible copy carries NO inner OS error: the inner `io::Error` /
+    // `minidumper::Error` / `crash_handler::Error` can embed a local executable
+    // path, an OS errno, or the IPC socket/pipe name. We surface a fixed,
+    // non-identifying class string with a plain recovery step instead (mirrors
+    // the `non_identifying()` discipline in the Tor transport). The inner error
+    // is still available structurally on the variant for a host-side log toggle.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ArmError::SpawnMonitor(e) => write!(f, "failed to spawn crash monitor: {e}"),
-            ArmError::Connect(e) => write!(f, "failed to connect to crash monitor: {e}"),
-            ArmError::AttachHandler(e) => write!(f, "failed to attach crash handler: {e}"),
+            ArmError::SpawnMonitor(_) => f.write_str(
+                "Crash protection could not start. Restart the app; if it keeps happening, reinstall.",
+            ),
+            ArmError::Connect(_) => {
+                f.write_str("Crash protection could not start. Restart the app to try again.")
+            }
+            ArmError::AttachHandler(_) => f.write_str(
+                "Crash protection could not start on this system. The app will run normally without it.",
+            ),
         }
     }
 }
@@ -240,21 +252,50 @@ mod tests {
             "monitor exe missing",
         ));
         let spawn_msg = format!("{spawn}");
-        assert!(spawn_msg.contains("failed to spawn crash monitor"));
-        assert!(spawn_msg.contains("monitor exe missing"));
+        assert!(spawn_msg.contains("Crash protection could not start"));
+        assert!(spawn_msg.contains("reinstall"));
 
         let connect = ArmError::Connect(minidumper::Error::InvalidName);
         let connect_msg = format!("{connect}");
-        assert!(connect_msg.contains("failed to connect to crash monitor"));
+        assert!(connect_msg.contains("Crash protection could not start"));
+        assert!(connect_msg.contains("Restart the app"));
 
         let attach = ArmError::AttachHandler(crash_handler::Error::OutOfMemory);
         let attach_msg = format!("{attach}");
-        assert!(attach_msg.contains("failed to attach crash handler"));
+        assert!(attach_msg.contains("run normally without it"));
 
         // ArmError implements std::error::Error + Debug (host bubbles it up).
         let e: &dyn std::error::Error = &spawn;
         assert!(e.source().is_none());
         assert!(format!("{spawn:?}").contains("SpawnMonitor"));
+    }
+
+    /// REDACTION GUARANTEE (WS-001/002/003): the host-visible `Display` of an
+    /// `ArmError` must NEVER carry the inner OS error — no local path, no errno,
+    /// no socket/pipe name, no internal helper-process name. We construct each
+    /// variant with a deliberately leaky inner error and prove none of it
+    /// survives into the user-facing string.
+    #[test]
+    fn arm_error_display_never_leaks_inner_os_detail() {
+        let leaky_path = "/home/jane/.config/app/w1tn3ss-crash-monitor";
+        let spawn = ArmError::SpawnMonitor(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("os error 13: cannot exec {leaky_path}"),
+        ));
+        for err in [
+            spawn,
+            ArmError::Connect(minidumper::Error::InvalidName),
+            ArmError::AttachHandler(crash_handler::Error::OutOfMemory),
+        ] {
+            let shown = format!("{err}");
+            assert!(!shown.contains(leaky_path), "path leaked: {shown}");
+            assert!(!shown.contains('/'), "a path separator leaked: {shown}");
+            assert!(!shown.contains("os error"), "an errno leaked: {shown}");
+            assert!(
+                !shown.contains("monitor"),
+                "internal helper-process name leaked: {shown}"
+            );
+        }
     }
 
     #[test]
