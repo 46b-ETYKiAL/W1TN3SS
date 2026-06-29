@@ -51,10 +51,17 @@ pub enum SubmitError {
 }
 
 impl std::fmt::Display for SubmitError {
+    // No internal tier/protocol jargon ("tier-a", "star") and no inner error
+    // interpolation. The inner error stays on the variant for a host-side log
+    // toggle.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SubmitError::Star(e) => write!(f, "tier-a star error: {e}"),
-            SubmitError::Transport(e) => write!(f, "tier-a transport error: {e}"),
+            SubmitError::Star(_) => {
+                f.write_str("The anonymous signal could not be prepared and was not sent.")
+            }
+            SubmitError::Transport(_) => f.write_str(
+                "The anonymous signal could not be sent right now; it will be retried later.",
+            ),
         }
     }
 }
@@ -126,6 +133,42 @@ mod tests {
     use super::*;
     use crate::measurement::AggregateMeasurement;
     use crate::star::StarProducer;
+
+    /// WS-034/035: `SubmitError` Display carries no internal tier/protocol jargon
+    /// ("tier-a", "star") and never interpolates the inner error.
+    #[test]
+    fn submit_error_display_is_plain_and_jargon_free() {
+        let star = SubmitError::Star(StarError::Generate("0xdead inner".to_string()));
+        let star_shown = format!("{star}");
+        assert_eq!(
+            star_shown,
+            "The anonymous signal could not be prepared and was not sent."
+        );
+        let transport = SubmitError::Transport(SendError::Transport(
+            "os error 2 at /home/jane/sock".to_string(),
+        ));
+        let transport_shown = format!("{transport}");
+        assert_eq!(
+            transport_shown,
+            "The anonymous signal could not be sent right now; it will be retried later."
+        );
+        for shown in [&star_shown, &transport_shown] {
+            let lower = shown.to_lowercase();
+            for needle in [
+                "tier-a",
+                "star error",
+                "transport error",
+                "0xdead",
+                "os error",
+            ] {
+                assert!(
+                    !lower.contains(needle),
+                    "jargon/inner detail leaked: {shown}"
+                );
+            }
+            assert!(!shown.contains('/'), "path separator leaked: {shown}");
+        }
+    }
 
     fn measurement() -> AggregateMeasurement {
         AggregateMeasurement::new(

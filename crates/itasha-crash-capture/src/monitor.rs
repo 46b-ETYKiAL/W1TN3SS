@@ -126,12 +126,13 @@ impl MonitorHandler {
         // 1. Read the raw written dump.
         let mut bytes = match std::fs::read(raw_path) {
             Ok(b) => b,
-            Err(e) => {
+            Err(_e) => {
                 // Best-effort delete even on read failure (it may be partially
                 // written and still PII-bearing).
                 let _ = std::fs::remove_file(raw_path);
                 self.record(CaptureOutcome::CaptureFailed {
-                    reason: format!("read dump failed: {e}"),
+                    // No inner `io::Error`: it can embed the dump path / OS errno.
+                    reason: "A crash report could not be processed and was discarded; nothing was saved or sent.".to_string(),
                 });
                 return;
             }
@@ -141,13 +142,16 @@ impl MonitorHandler {
         //    coarsen the module list). Fail-closed on a parse error.
         let scrub = match crate::scrub::scrub_minidump_in_place(&mut bytes) {
             Ok(report) => report,
-            Err(e) => {
+            Err(_e) => {
                 // The raw dump is deleted; the un-minimizable bytes are dropped
                 // (zeroed in memory) and never spooled.
                 bytes.iter_mut().for_each(|b| *b = 0);
                 let _ = std::fs::remove_file(raw_path);
+                // Behavioral sentinel (asserted by the structural-isolation
+                // privacy contract): an un-minimizable dump is "fail-closed, not spooled".
+                // The user-visible `reason` carries no inner error or design jargon.
                 self.record(CaptureOutcome::CaptureFailed {
-                    reason: format!("scrub failed (fail-closed, not spooled): {e}"),
+                    reason: "A crash report could not be safely cleaned and was discarded; nothing was saved or sent.".to_string(),
                 });
                 return;
             }
@@ -155,12 +159,13 @@ impl MonitorHandler {
 
         // 3. DELETE the raw pre-scrub dump immediately — it is the only copy of
         //    the un-minimized bytes and must never persist to a durable path.
-        if let Err(e) = std::fs::remove_file(raw_path) {
+        if let Err(_e) = std::fs::remove_file(raw_path) {
             // If we cannot delete the raw dump, do NOT spool — leaving both the
             // raw (PII-bearing) dump and a spooled copy is worse than failing.
             bytes.iter_mut().for_each(|b| *b = 0);
             self.record(CaptureOutcome::CaptureFailed {
-                reason: format!("raw dump delete failed (fail-closed, not spooled): {e}"),
+                // No inner `io::Error` (errno / dump path) and no design jargon.
+                reason: "A crash report could not be processed and was discarded; nothing was saved or sent.".to_string(),
             });
             return;
         }
@@ -171,8 +176,10 @@ impl MonitorHandler {
                 path: spooled,
                 scrub,
             }),
-            Err(e) => self.record(CaptureOutcome::CaptureFailed {
-                reason: format!("spool failed: {e}"),
+            Err(_e) => self.record(CaptureOutcome::CaptureFailed {
+                // No inner `SpoolError` (errno / local spool path).
+                reason: "A crash report could not be saved to this device and was discarded."
+                    .to_string(),
             }),
         }
     }
@@ -193,8 +200,9 @@ impl ServerHandler for MonitorHandler {
     fn on_minidump_created(&self, result: Result<MinidumpBinary, minidumper::Error>) -> LoopAction {
         match result {
             Ok(md) => self.minimize_delete_and_spool(&md.path),
-            Err(e) => self.record(CaptureOutcome::CaptureFailed {
-                reason: format!("minidump write failed: {e}"),
+            Err(_e) => self.record(CaptureOutcome::CaptureFailed {
+                // No inner writer error.
+                reason: "A crash report could not be created and was discarded.".to_string(),
             }),
         }
         // One crash → one dump → exit the monitor loop.
@@ -370,10 +378,22 @@ mod tests {
         }));
 
         let outcomes = h.take_outcomes();
-        assert!(
-            matches!(outcomes[0], CaptureOutcome::CaptureFailed { .. }),
-            "an unparseable dump must fail-closed, never spool"
-        );
+        match &outcomes[0] {
+            CaptureOutcome::CaptureFailed { reason } => {
+                // WS-008: plain copy, no inner error / design jargon.
+                assert!(
+                    reason.contains("could not be safely cleaned and was discarded"),
+                    "expected the plain scrub-failure copy, got: {reason}"
+                );
+                assert!(!reason.contains('/'), "path separator leaked: {reason}");
+                assert!(!reason.contains("os error"), "errno leaked: {reason}");
+                assert!(
+                    !reason.contains("fail-closed"),
+                    "design jargon leaked: {reason}"
+                );
+            }
+            other => panic!("an unparseable dump must fail-closed, got {other:?}"),
+        }
         // The raw dump is deleted even on fail-closed.
         assert!(
             !path.exists(),
@@ -397,7 +417,16 @@ mod tests {
         // `LoopAction` derives `PartialEq` but not `Debug`; use `assert!`.
         assert!(action == LoopAction::Exit);
         let outcomes = h.take_outcomes();
-        assert!(matches!(outcomes[0], CaptureOutcome::CaptureFailed { .. }));
+        match &outcomes[0] {
+            CaptureOutcome::CaptureFailed { reason } => {
+                // WS-011: plain copy, no inner writer error.
+                assert_eq!(
+                    reason,
+                    "A crash report could not be created and was discarded."
+                );
+            }
+            other => panic!("expected CaptureFailed, got {other:?}"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -446,8 +475,15 @@ mod tests {
         match &outcomes[0] {
             CaptureOutcome::CaptureFailed { reason } => {
                 assert!(
-                    reason.contains("read dump failed"),
-                    "expected a read-dump failure reason, got: {reason}"
+                    reason.contains("could not be processed and was discarded"),
+                    "expected a plain discard reason, got: {reason}"
+                );
+                // REDACTION (WS-007): no inner io::Error — no path, no errno.
+                assert!(!reason.contains('/'), "path separator leaked: {reason}");
+                assert!(!reason.contains("os error"), "errno leaked: {reason}");
+                assert!(
+                    !reason.contains(": "),
+                    "inner-error suffix leaked: {reason}"
                 );
             }
             other => panic!("expected CaptureFailed, got {other:?}"),
@@ -490,8 +526,15 @@ mod tests {
         match &outcomes[0] {
             CaptureOutcome::CaptureFailed { reason } => {
                 assert!(
-                    reason.contains("spool failed"),
-                    "expected a spool failure reason, got: {reason}"
+                    reason.contains("could not be saved to this device"),
+                    "expected a plain save-failure reason, got: {reason}"
+                );
+                // REDACTION (WS-010): no inner SpoolError — no path, no errno.
+                assert!(!reason.contains('/'), "path separator leaked: {reason}");
+                assert!(!reason.contains("os error"), "errno leaked: {reason}");
+                assert!(
+                    !reason.contains("spool"),
+                    "internal 'spool' identifier leaked: {reason}"
                 );
             }
             other => panic!("expected CaptureFailed (spool), got {other:?}"),
@@ -545,8 +588,15 @@ mod tests {
         match &outcomes[0] {
             CaptureOutcome::CaptureFailed { reason } => {
                 assert!(
-                    reason.contains("raw dump delete failed"),
-                    "expected a raw-delete failure reason, got: {reason}"
+                    reason.contains("could not be processed and was discarded"),
+                    "expected a plain discard reason, got: {reason}"
+                );
+                // REDACTION (WS-009): no inner io::Error / design jargon.
+                assert!(!reason.contains('/'), "path separator leaked: {reason}");
+                assert!(!reason.contains("os error"), "errno leaked: {reason}");
+                assert!(
+                    !reason.contains("fail-closed"),
+                    "design jargon leaked: {reason}"
                 );
             }
             other => panic!("expected CaptureFailed (raw delete), got {other:?}"),

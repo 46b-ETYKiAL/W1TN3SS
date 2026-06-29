@@ -109,12 +109,19 @@ pub enum ScrubError {
 }
 
 impl std::fmt::Display for ScrubError {
+    // Plain, non-jargon copy: a host that surfaces a scrub failure should not
+    // show minidump-format internals ("header", "signature", "stream
+    // directory"). The discarded-and-not-saved framing is the user-relevant fact.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ScrubError::TooShort => write!(f, "buffer too short for a minidump header"),
-            ScrubError::BadSignature => write!(f, "not a minidump (bad signature)"),
+            ScrubError::TooShort => {
+                f.write_str("The crash file was incomplete and was discarded, not saved.")
+            }
+            ScrubError::BadSignature => {
+                f.write_str("The crash file was not a valid crash report and was discarded.")
+            }
             ScrubError::DirectoryOutOfBounds => {
-                write!(f, "minidump stream directory out of bounds")
+                f.write_str("The crash file was malformed and was discarded, not saved.")
             }
         }
     }
@@ -643,18 +650,31 @@ mod tests {
 
     #[test]
     fn scrub_error_display_strings_are_distinct_and_descriptive() {
+        // WS-004/005/006: plain, non-jargon copy — the discarded-and-not-saved
+        // fact, never minidump-format internals ("header"/"signature"/"stream
+        // directory").
         assert_eq!(
             format!("{}", ScrubError::TooShort),
-            "buffer too short for a minidump header"
+            "The crash file was incomplete and was discarded, not saved."
         );
         assert_eq!(
             format!("{}", ScrubError::BadSignature),
-            "not a minidump (bad signature)"
+            "The crash file was not a valid crash report and was discarded."
         );
         assert_eq!(
             format!("{}", ScrubError::DirectoryOutOfBounds),
-            "minidump stream directory out of bounds"
+            "The crash file was malformed and was discarded, not saved."
         );
+        for shown in [
+            format!("{}", ScrubError::TooShort),
+            format!("{}", ScrubError::BadSignature),
+            format!("{}", ScrubError::DirectoryOutOfBounds),
+        ] {
+            let lower = shown.to_lowercase();
+            for jargon in ["minidump", "signature", "header", "stream directory"] {
+                assert!(!lower.contains(jargon), "format jargon leaked: {shown}");
+            }
+        }
         // The error implements std::error::Error (source defaults to None).
         let e: &dyn std::error::Error = &ScrubError::TooShort;
         assert!(e.source().is_none());

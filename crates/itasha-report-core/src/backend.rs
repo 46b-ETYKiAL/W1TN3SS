@@ -51,12 +51,18 @@ pub enum SendError {
 }
 
 impl std::fmt::Display for SendError {
+    // Plain, host-visible copy only. The raw byte counts (PayloadTooLarge) and
+    // the inner transport reason (Transport) are kept on the struct/variant for
+    // a host-side log toggle, but are NEVER interpolated into the user-facing
+    // string — a fixed non-identifying class string is shown instead.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SendError::PayloadTooLarge { actual, cap } => {
-                write!(f, "payload {actual} bytes exceeds cap {cap} bytes")
+            SendError::PayloadTooLarge { .. } => {
+                f.write_str("This report is too large to send and was not sent.")
             }
-            SendError::Transport(m) => write!(f, "transport error: {m}"),
+            SendError::Transport(_) => {
+                f.write_str("The report could not be sent right now; it will be retried later.")
+            }
         }
     }
 }
@@ -201,8 +207,9 @@ impl IngestBackend for SentryStubBackend {
                 cap: self.config.max_payload_bytes,
             });
         }
+        // Host-visible outcome: no provider name, no implementation jargon.
         Ok(SendOutcome::Failed(
-            "sentry-stub: not yet enabled (wire-format parity verified)".to_string(),
+            "sending is not enabled in this build.".to_string(),
         ))
     }
 }
@@ -225,12 +232,19 @@ fn event_id_from_nonce(nonce: &str) -> String {
     hex
 }
 
-/// Map a transport error to a non-identifying reason string (no URLs, no host).
+/// Map a transport error to a plain, non-identifying host-visible reason (no
+/// URLs, no host, no status numbers, no bare protocol tokens). Each arm is a
+/// fixed user-facing class string with a recovery expectation.
 fn transport_reason(e: &ureq::Error) -> String {
     match e {
-        ureq::Error::StatusCode(code) => format!("http status {code}"),
-        ureq::Error::Timeout(_) => "timeout".to_string(),
-        _ => "transport failure".to_string(),
+        ureq::Error::StatusCode(_) => {
+            "The report could not be delivered (server rejected it); it will be retried later."
+                .to_string()
+        }
+        ureq::Error::Timeout(_) => {
+            "Sending the report timed out; it will be retried later.".to_string()
+        }
+        _ => "The report could not be sent right now; it will be retried later.".to_string(),
     }
 }
 
@@ -292,27 +306,66 @@ mod tests {
         let outcome = stub.send(&report, &consent).unwrap();
         // The stub does not transmit; it reports a non-enabled outcome.
         match outcome {
-            SendOutcome::Failed(reason) => assert!(reason.contains("sentry-stub")),
+            SendOutcome::Failed(reason) => {
+                assert!(
+                    reason.contains("not enabled in this build"),
+                    "got: {reason}"
+                );
+                // DE-BRAND (WS-015): the provider name must not appear, nor any
+                // implementation jargon.
+                let lower = reason.to_lowercase();
+                assert!(!lower.contains("sentry"), "provider name leaked: {reason}");
+                assert!(!lower.contains("stub"), "impl jargon leaked: {reason}");
+                assert!(
+                    !lower.contains("wire-format"),
+                    "impl jargon leaked: {reason}"
+                );
+            }
             SendOutcome::Sent => panic!("stub must not claim Sent"),
         }
     }
 
     #[test]
     fn send_error_display_renders_both_arms() {
-        // PayloadTooLarge arm (lines 56-58): the message names the actual + cap.
+        // PayloadTooLarge arm: plain copy, NO raw byte counts (WS-013).
         let too_large = SendError::PayloadTooLarge {
             actual: 9_000,
             cap: 8_000,
         };
         let s = format!("{too_large}");
-        assert_eq!(s, "payload 9000 bytes exceeds cap 8000 bytes");
+        assert_eq!(s, "This report is too large to send and was not sent.");
+        assert!(!s.contains("9000"), "raw byte count leaked: {s}");
+        assert!(!s.contains("8000"), "raw byte cap leaked: {s}");
 
-        // Transport arm (line 59): the message carries the inner reason.
+        // Transport arm: plain copy, NO inner reason / "transport error:" jargon
+        // (WS-014).
         let transport = SendError::Transport("connection refused".to_string());
+        let t = format!("{transport}");
         assert_eq!(
-            format!("{transport}"),
-            "transport error: connection refused"
+            t,
+            "The report could not be sent right now; it will be retried later."
         );
+        assert!(!t.contains("transport error"), "dev jargon leaked: {t}");
+        assert!(
+            !t.contains("connection refused"),
+            "inner reason leaked: {t}"
+        );
+    }
+
+    /// REDACTION GUARANTEE (WS-014): even when a `SendError::Transport` is built
+    /// with a deliberately leaky inner message (errno + local path), the
+    /// host-visible `Display` shows the fixed class string only — the inner
+    /// content can never reach a host log via `Display`.
+    #[test]
+    fn send_error_transport_display_never_leaks_inner_message() {
+        let leaky = SendError::Transport(
+            "os error 13 at /home/jane/.config/app/sock: permission denied".to_string(),
+        );
+        let shown = format!("{leaky}");
+        assert!(!shown.contains('/'), "path separator leaked: {shown}");
+        assert!(!shown.contains("os error"), "errno leaked: {shown}");
+        assert!(!shown.contains("jane"), "username leaked: {shown}");
+        assert!(!shown.contains("sock"), "socket name leaked: {shown}");
     }
 
     #[test]
@@ -321,7 +374,9 @@ mod tests {
         // `source()`/`Display` are reachable as an error value.
         let err = SendError::Transport("x".to_string());
         let dyn_err: &dyn std::error::Error = &err;
-        assert!(dyn_err.to_string().starts_with("transport error:"));
+        assert!(dyn_err
+            .to_string()
+            .starts_with("The report could not be sent"));
         assert!(dyn_err.source().is_none());
     }
 
@@ -476,8 +531,14 @@ mod tests {
         match outcome {
             SendOutcome::Failed(reason) => {
                 // ureq 3.x defaults to http_status_as_error, so a 500 surfaces as
-                // Error::StatusCode → "http status 500".
-                assert_eq!(reason, "http status 500", "got: {reason}");
+                // Error::StatusCode → the plain "server rejected it" class copy
+                // (WS-016): no status NUMBER, no host/URL.
+                assert_eq!(
+                    reason,
+                    "The report could not be delivered (server rejected it); it will be retried later.",
+                    "got: {reason}"
+                );
+                assert!(!reason.contains("500"), "raw status code leaked: {reason}");
                 assert!(!reason.contains("127.0.0.1"), "host leaked: {reason}");
             }
             SendOutcome::Sent => panic!("a 500 response must not claim Sent"),
@@ -512,7 +573,12 @@ mod tests {
         handle.join().ok();
         match outcome {
             SendOutcome::Failed(reason) => {
-                assert_eq!(reason, "timeout", "expected a timeout class, got: {reason}");
+                // WS-017: plain timeout copy with a retry expectation, never the
+                // bare "timeout" token.
+                assert_eq!(
+                    reason, "Sending the report timed out; it will be retried later.",
+                    "expected the plain timeout class, got: {reason}"
+                );
             }
             SendOutcome::Sent => panic!("a stalled server must not claim Sent"),
         }

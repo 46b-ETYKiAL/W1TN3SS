@@ -66,10 +66,18 @@ pub enum EnvelopeError {
 }
 
 impl std::fmt::Display for EnvelopeError {
+    // The inner `serde_json::Error` can quote the offending input fragment (which
+    // may include report content), so it is NEVER interpolated into the
+    // host-visible string. The inner error stays on the variant for a host-side
+    // log toggle.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EnvelopeError::Malformed(m) => write!(f, "malformed envelope: {m}"),
-            EnvelopeError::Json(e) => write!(f, "envelope json error: {e}"),
+            EnvelopeError::Malformed(_) => {
+                f.write_str("The report could not be read; it may be corrupted.")
+            }
+            EnvelopeError::Json(_) => {
+                f.write_str("The report could not be read; its format is invalid.")
+            }
         }
     }
 }
@@ -477,21 +485,38 @@ mod tests {
 
     #[test]
     fn envelope_error_display_renders_both_arms() {
-        // EnvelopeError Display (lines 69-74): the Malformed arm names the detail.
-        let malformed = EnvelopeError::Malformed("missing newline".into());
+        // WS-025/026: plain copy; the inner detail (which can quote report
+        // content fragments) is NEVER interpolated into the host-visible string.
+        let malformed = EnvelopeError::Malformed("secret-fragment-from-report".into());
+        let m_shown = format!("{malformed}");
         assert_eq!(
-            format!("{malformed}"),
-            "malformed envelope: missing newline"
+            m_shown,
+            "The report could not be read; it may be corrupted."
+        );
+        assert!(
+            !m_shown.contains("secret-fragment-from-report"),
+            "inner detail leaked: {m_shown}"
         );
         let dyn_err: &dyn std::error::Error = &malformed;
-        assert!(dyn_err.to_string().starts_with("malformed envelope:"));
+        assert!(dyn_err
+            .to_string()
+            .starts_with("The report could not be read"));
 
-        // The Json arm: a real serde_json error wraps via From (lines 80-82) and
-        // formats with the "envelope json error:" prefix.
+        // The Json arm: a real serde_json error wraps via From and shows the fixed
+        // "format is invalid" copy — the serde detail (which can quote the
+        // offending input fragment) does not reach the user-facing string.
         let json_err: serde_json::Error = serde_json::from_str::<EnvelopeHeader>("{").unwrap_err();
         let wrapped: EnvelopeError = json_err.into();
         let shown = format!("{wrapped}");
-        assert!(shown.starts_with("envelope json error:"), "got: {shown}");
+        assert_eq!(
+            shown,
+            "The report could not be read; its format is invalid."
+        );
+        assert!(
+            !shown.contains("envelope json error"),
+            "jargon leaked: {shown}"
+        );
+        assert!(!shown.contains("column"), "serde detail leaked: {shown}");
         match wrapped {
             EnvelopeError::Json(_) => {}
             EnvelopeError::Malformed(_) => panic!("From must yield the Json variant"),

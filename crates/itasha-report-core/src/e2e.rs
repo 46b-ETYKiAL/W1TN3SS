@@ -139,14 +139,30 @@ pub enum E2eError {
 }
 
 impl std::fmt::Display for E2eError {
+    // Plain copy with a recovery step where one exists. The inner `age` error
+    // string (which can quote key-parsing or payload fragments) is kept on the
+    // variant for a host-side log toggle but is NEVER interpolated here, and the
+    // "e2e" jargon is dropped.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            E2eError::InvalidRecipient(m) => write!(f, "invalid developer recipient: {m}"),
-            E2eError::InvalidIdentity(m) => write!(f, "invalid developer identity: {m}"),
-            E2eError::NoRecipients => write!(f, "no developer recipients supplied"),
-            E2eError::Encrypt(m) => write!(f, "e2e encrypt failed: {m}"),
-            E2eError::Decrypt(m) => write!(f, "e2e decrypt failed: {m}"),
-            E2eError::Payload(m) => write!(f, "e2e payload error: {m}"),
+            E2eError::InvalidRecipient(_) => f.write_str(
+                "The developer encryption key for reports is not valid. Check the configured recipient key.",
+            ),
+            E2eError::InvalidIdentity(_) => f.write_str(
+                "The developer decryption key is not valid. Check the configured identity key.",
+            ),
+            E2eError::NoRecipients => f.write_str(
+                "No developer encryption key is configured, so the report cannot be encrypted. Add a recipient key.",
+            ),
+            E2eError::Encrypt(_) => {
+                f.write_str("The report could not be encrypted and was not sent.")
+            }
+            E2eError::Decrypt(_) => {
+                f.write_str("The report could not be decrypted (wrong key or corrupted data).")
+            }
+            E2eError::Payload(_) => {
+                f.write_str("The decrypted report could not be read; it may be corrupted.")
+            }
         }
     }
 }
@@ -507,31 +523,53 @@ mod tests {
 
     #[test]
     fn e2e_error_display_renders_every_variant() {
-        // E2eError Display (lines 142-151): each variant formats with its prefix
-        // and inner message, all distinct and non-panicking.
+        // WS-019..024: plain copy (recovery steps for config errors), the "e2e"
+        // jargon dropped, and the inner `age` message NEVER interpolated. We feed
+        // each carrier variant a deliberately leaky inner message and prove it is
+        // absent from the host-visible string.
+        let leak = "age secret AGE-SECRET-KEY-1qqq at /home/jane/key.txt (os error 2)";
         let cases = [
             (
-                E2eError::InvalidRecipient("bad".into()),
-                "invalid developer recipient: bad",
+                E2eError::InvalidRecipient(leak.into()),
+                "The developer encryption key for reports is not valid. Check the configured recipient key.",
             ),
             (
-                E2eError::InvalidIdentity("nope".into()),
-                "invalid developer identity: nope",
-            ),
-            (E2eError::NoRecipients, "no developer recipients supplied"),
-            (E2eError::Encrypt("boom".into()), "e2e encrypt failed: boom"),
-            (
-                E2eError::Decrypt("tamper".into()),
-                "e2e decrypt failed: tamper",
+                E2eError::InvalidIdentity(leak.into()),
+                "The developer decryption key is not valid. Check the configured identity key.",
             ),
             (
-                E2eError::Payload("garbage".into()),
-                "e2e payload error: garbage",
+                E2eError::NoRecipients,
+                "No developer encryption key is configured, so the report cannot be encrypted. Add a recipient key.",
+            ),
+            (
+                E2eError::Encrypt(leak.into()),
+                "The report could not be encrypted and was not sent.",
+            ),
+            (
+                E2eError::Decrypt(leak.into()),
+                "The report could not be decrypted (wrong key or corrupted data).",
+            ),
+            (
+                E2eError::Payload(leak.into()),
+                "The decrypted report could not be read; it may be corrupted.",
             ),
         ];
         for (err, expected) in cases {
-            assert_eq!(format!("{err}"), expected);
-            // It is a real std::error::Error too (line 154).
+            let shown = format!("{err}");
+            assert_eq!(shown, expected);
+            // REDACTION: no inner age detail, no key material, no errno/path,
+            // no "e2e" jargon.
+            assert!(
+                !shown.contains("AGE-SECRET-KEY"),
+                "key material leaked: {shown}"
+            );
+            assert!(!shown.contains('/'), "path separator leaked: {shown}");
+            assert!(!shown.contains("os error"), "errno leaked: {shown}");
+            assert!(
+                !shown.to_lowercase().contains("e2e"),
+                "jargon leaked: {shown}"
+            );
+            // It is a real std::error::Error too.
             let dyn_err: &dyn std::error::Error = &err;
             assert_eq!(dyn_err.to_string(), expected);
         }

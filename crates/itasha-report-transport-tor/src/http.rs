@@ -35,11 +35,20 @@ pub enum HttpError {
 }
 
 impl std::fmt::Display for HttpError {
+    // Plain copy with a retry expectation; no protocol jargon and no inner
+    // stream-error detail. The inner reason stays on the variant for a host-side
+    // log toggle.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HttpError::Write(m) => write!(f, "http write error: {m}"),
-            HttpError::Read(m) => write!(f, "http read error: {m}"),
-            HttpError::BadStatusLine => write!(f, "http malformed status line"),
+            HttpError::Write(_) => {
+                f.write_str("The report could not be sent right now; it will be retried later.")
+            }
+            HttpError::Read(_) => f.write_str(
+                "The report could not be delivered right now; it will be retried later.",
+            ),
+            HttpError::BadStatusLine => f.write_str(
+                "The server gave an invalid response; the report will be retried later.",
+            ),
         }
     }
 }
@@ -127,6 +136,33 @@ pub fn parse_status_code(response: &[u8]) -> Result<u16, HttpError> {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    /// WS-036/037/038: `HttpError` Display carries plain copy with a retry
+    /// expectation, no protocol jargon, and no inner stream-error detail.
+    #[test]
+    fn http_error_display_is_plain_and_jargon_free() {
+        let write = HttpError::Write("connection reset (os error 104)".to_string());
+        let read = HttpError::Read("broken pipe at /tmp/sock".to_string());
+        let bad = HttpError::BadStatusLine;
+        assert_eq!(
+            format!("{write}"),
+            "The report could not be sent right now; it will be retried later."
+        );
+        assert_eq!(
+            format!("{read}"),
+            "The report could not be delivered right now; it will be retried later."
+        );
+        assert_eq!(
+            format!("{bad}"),
+            "The server gave an invalid response; the report will be retried later."
+        );
+        for err in [&write, &read] {
+            let shown = format!("{err}");
+            assert!(!shown.contains("os error"), "errno leaked: {shown}");
+            assert!(!shown.contains('/'), "path separator leaked: {shown}");
+            assert!(!shown.contains("http "), "protocol jargon leaked: {shown}");
+        }
+    }
 
     #[test]
     fn parses_2xx_status() {
