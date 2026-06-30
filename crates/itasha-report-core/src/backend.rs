@@ -144,20 +144,33 @@ impl LeanPipelineBackend {
     /// Serialize the report to an envelope, enforce the size cap, and return
     /// the wire bytes + the per-report event id derived from the consent nonce.
     fn build_payload(&self, report: &Report, consent: &ConsentToken) -> Result<Vec<u8>, SendError> {
-        // The event_id is derived solely from the ephemeral consent nonce — it
-        // is per-report and carries no stable identity. Pad/trim to the 32-hex
-        // shape Sentry expects.
-        let event_id = event_id_from_nonce(consent.nonce());
-        let envelope = Envelope::from_report(report, Some(event_id));
-        let bytes = envelope.to_bytes();
-        if bytes.len() > self.config.max_payload_bytes {
-            return Err(SendError::PayloadTooLarge {
-                actual: bytes.len(),
-                cap: self.config.max_payload_bytes,
-            });
-        }
-        Ok(bytes)
+        build_capped_envelope_bytes(report, consent, self.config.max_payload_bytes)
     }
+}
+
+/// Serialize `report` to a Sentry envelope under the ephemeral consent nonce and
+/// enforce the size cap. The single source of truth for the wire payload, shared
+/// by [`LeanPipelineBackend`] and [`SentryStubBackend`] so the two backends can
+/// never drift in how they build or size-check the envelope.
+///
+/// The `event_id` is derived solely from the ephemeral consent nonce — it is
+/// per-report and carries no stable identity (pad/trim to the 32-hex shape
+/// Sentry expects).
+fn build_capped_envelope_bytes(
+    report: &Report,
+    consent: &ConsentToken,
+    cap: usize,
+) -> Result<Vec<u8>, SendError> {
+    let event_id = event_id_from_nonce(consent.nonce());
+    let envelope = Envelope::from_report(report, Some(event_id));
+    let bytes = envelope.to_bytes();
+    if bytes.len() > cap {
+        return Err(SendError::PayloadTooLarge {
+            actual: bytes.len(),
+            cap,
+        });
+    }
+    Ok(bytes)
 }
 
 impl IngestBackend for LeanPipelineBackend {
@@ -198,15 +211,7 @@ impl IngestBackend for SentryStubBackend {
     fn send(&self, report: &Report, consent: &ConsentToken) -> Result<SendOutcome, SendError> {
         // Build the identical envelope the lean pipeline would, enforcing the
         // same size cap — proving wire-format parity — but do not transmit.
-        let event_id = event_id_from_nonce(consent.nonce());
-        let envelope = Envelope::from_report(report, Some(event_id));
-        let bytes = envelope.to_bytes();
-        if bytes.len() > self.config.max_payload_bytes {
-            return Err(SendError::PayloadTooLarge {
-                actual: bytes.len(),
-                cap: self.config.max_payload_bytes,
-            });
-        }
+        let _bytes = build_capped_envelope_bytes(report, consent, self.config.max_payload_bytes)?;
         // Host-visible outcome: no provider name, no implementation jargon.
         Ok(SendOutcome::Failed(
             "sending is not enabled in this build.".to_string(),

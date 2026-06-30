@@ -28,6 +28,16 @@ never always-on.
 |---|---|
 | [`itasha-report-core`](crates/itasha-report-core) | Safe SDK spine: two-stream config, sanitizer, local spool, hardened transport, `IngestBackend` + Sentry-envelope wire, previewable payload, GitHub-issue / clipboard / mailto intake helpers. `send` requires a non-forgeable `ConsentToken`. |
 | [`itasha-crash-capture`](crates/itasha-crash-capture) | Unsafe-isolated native minidump capture (Tier-2), out-of-process. Spooled locally, never auto-sent; gated on heightened consent. |
+| [`itasha-report-transport-tor`](crates/itasha-report-transport-tor) | **Opt-in** anonymous transport: an `IngestBackend` that POSTs the envelope over an embedded Arti (pure-Rust Tor) v3 onion, so the server never learns the client IP. Fixed-minimal headers, fixed-bucket body padding, send-time jitter; fire-and-forget spool drain with capped backed-off retry. Behind the live-Tor `OnionConnector` seam. Separate crate so the Arti tree never touches the base crate. |
+| [`itasha-report-aggregate`](crates/itasha-report-aggregate) | **Opt-in Tier-A**: the only stream that is honestly *anonymous*. Submits a k-anonymous [STAR](https://arxiv.org/abs/2109.10074) message over a low-dimensional crash-signature + coarse quasi-tuple — the operator learns a signature only once ≥ k (default 25) distinct clients report it, with no per-user identifier. Its own consent (`AggregateMode`, default-OFF), separate from Tier-B. Separate crate so the STAR crypto tree never touches the base crate. |
+
+### The honest two-tier model
+
+A detailed scrubbed report (Tier-B: `itasha-report-core` + the Tor transport) is
+irreducibly high-dimensional and stays honestly **pseudonymous** — no scrubbing
+makes a unique stack "anonymous". Only the *aggregate* k-anonymous signal
+(`itasha-report-aggregate`, Tier-A) is **truly anonymous**. Both tiers are
+default-OFF and separately consented; opting into one never opts into the other.
 
 ## Use
 
