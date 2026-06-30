@@ -43,8 +43,11 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain (stable + rustfmt + clippy)
-        uses: dtolnay/rust-toolchain@stable
+        # SHA-pinned (dtolnay/rust-toolchain master); the channel is selected by
+        # the `toolchain:` input, not the ref, so the SHA can be immutable.
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master 2026-06-30
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo registry + git + build
@@ -83,12 +86,14 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain (stable + llvm-tools)
-        uses: dtolnay/rust-toolchain@stable
+        # SHA-pinned (dtolnay/rust-toolchain master); channel via `toolchain:`.
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master 2026-06-30
         with:
+          toolchain: stable
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov + cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2.82.6
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -124,17 +129,24 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GITLEAKS_VERSION: "8.30.1"
+      # SHA-256 of gitleaks_8.30.1_linux_x64.tar.gz from the upstream
+      # gitleaks_8.30.1_checksums.txt (verified 2026-06-30). Bump in lockstep
+      # with GITLEAKS_VERSION.
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
     steps:
       - name: Checkout (full history for full-repo scan)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
-      - name: Install gitleaks (OSS binary, pinned + checksum-free hardening)
+      - name: Install gitleaks (OSS binary, pinned + checksum-verified)
         run: |
           set -euo pipefail
           url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           curl -sSfL "$url" -o gitleaks.tar.gz
+          # Fail closed if the downloaded tarball does not match the pinned digest
+          # (defends against a tampered/substituted release asset over TLS).
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
           tar -xzf gitleaks.tar.gz gitleaks
           install -m 0755 gitleaks /usr/local/bin/gitleaks
           gitleaks version

@@ -14,9 +14,12 @@
 # on every push + PR so a known-vuln or un-vetted dependency fails CI.
 #
 # The release job runs ONLY on a pushed `v*` tag (a real release). The
-# supply-chain gate runs on every push/PR. All required jobs use the explicit
-# `if: always()` + guarded-step pattern so a conditionally-trivial run reports a
-# real SUCCESS, never a merge-queue "skipped == success" footgun.
+# supply-chain gate runs on every push/PR. The PR-required gate is `supply-chain`,
+# which has NO `on.*.paths:` filter and NO conditional `if:`, so it always runs on
+# every PR — there is no "skipped == success" footgun. The build/sign/provenance/
+# verify jobs are deliberately tag-gated (`if: startsWith(github.ref,
+# 'refs/tags/v')`) and are NOT PR-required, so their PR-time skip is correct, not
+# a silent pass.
 
 name: release-sign
 
@@ -49,7 +52,10 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # SHA-pinned (dtolnay/rust-toolchain master); channel via `toolchain:`.
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master 2026-06-30
+        with:
+          toolchain: stable
 
       - name: Cache cargo registry + git
         uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
@@ -65,10 +71,13 @@ jobs:
         # 0.21.2 pin chokes on any RustSec advisory carrying a `cvss = "CVSS:4.0/…"`
         # string ("unsupported CVSS version: 4.0"), which has failed this gate on
         # main since the advisory DB began publishing CVSS 4.0 entries. 0.22.2
-        # (2026-06-05) is the current stable.
+        # (2026-06-05) is the current stable. No unpinned `|| cargo install …`
+        # fallback: a failed pinned install must fail the gate, never silently
+        # install an unpinned (possibly CVSS-4.0-broken) version (dependency-
+        # management.md silent-drift rule).
         run: |
-          cargo install cargo-audit --locked --version 0.22.2 || cargo install cargo-audit --locked
-          cargo install cargo-auditable --locked || true
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo install cargo-auditable --locked
 
       # cargo-audit: fail on any RUSTSEC advisory affecting the locked tree.
       - name: cargo-audit (known-vuln gate)
@@ -77,21 +86,24 @@ jobs:
       # cargo-vet: fail on any dependency that is not yet vetted. The supply-chain
       # config under supply-chain/ holds the audit set + trusted publishers.
       - name: Install cargo-vet
-        run: cargo install cargo-vet --locked || true
+        run: cargo install cargo-vet --locked
       - name: cargo-vet (human-audited supply chain)
+        # supply-chain/config.toml is committed, so vet always runs in --locked
+        # gating mode. The bootstrap (init) branch is a hard error, not a silent
+        # warn-and-pass: an unvetted dependency must fail the gate.
         run: |
-          if [ -f supply-chain/config.toml ]; then
-            cargo vet --locked
-          else
-            echo "no supply-chain/config.toml yet — initializing the audit set"
-            cargo vet init
-            cargo vet || (echo "::warning::cargo-vet has unvetted deps; review supply-chain/audits.toml" && true)
+          if [ ! -f supply-chain/config.toml ]; then
+            echo "::error::supply-chain/config.toml is missing — the cargo-vet audit set is required"
+            exit 1
           fi
+          cargo vet --locked
 
       # cargo-auditable: prove the shipped binary can carry its own dependency
-      # manifest for post-hoc CVE attribution.
+      # manifest for post-hoc CVE attribution. No `|| cargo build` fallback: if
+      # the auditable build fails we must fail the gate rather than silently ship
+      # a binary WITHOUT the embedded dependency manifest (the whole point).
       - name: cargo-auditable build (embed dep tree)
-        run: cargo auditable build --release --workspace || cargo build --release --workspace
+        run: cargo auditable build --release --workspace
 
   # ---------------------------------------------------------------------------
   # Build + sign the release artifacts. Tag-gated (only on `v*`).
@@ -112,7 +124,10 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # SHA-pinned (dtolnay/rust-toolchain master); channel via `toolchain:`.
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master 2026-06-30
+        with:
+          toolchain: stable
 
       - name: Build release binaries (locked)
         run: cargo build --release --workspace --locked
@@ -164,17 +179,29 @@ jobs:
       # minisign OFFLINE anchor: a verifier with no Rekor/Fulcio access verifies
       # against the published minisign public key. The secret key is injected from
       # repo secrets, never committed.
+      #
+      # The presence check is done at RUNTIME in the script, NOT via a step-level
+      # `if: ${{ env.MINISIGN_SECRET_KEY != '' }}`: a step's own `env:` block is
+      # NOT in scope for that same step's `if:` (GitHub Actions evaluates `if`
+      # before the step env is materialized), so the old `if` was always false and
+      # this step silently never ran. Keeping the secret step-scoped (not hoisted
+      # to job-level env) and gating inside the run avoids both the silent-skip and
+      # widening the secret's blast radius across the job.
       - name: minisign sign (offline anchor)
-        if: ${{ env.MINISIGN_SECRET_KEY != '' }}
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::warning::MINISIGN_SECRET_KEY secret not set — skipping the offline minisign anchor (cosign keyless signatures still ship)."
+            exit 0
+          fi
           printf '%s' "$MINISIGN_SECRET_KEY" > minisign.key
           for f in dist/*; do
             case "$f" in *.sig|*.pem) continue;; esac
             [ -f "$f" ] || continue
-            echo "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m "$f" -x "$f.minisig"
+            echo "${MINISIGN_PASSWORD:-}" | minisign -S -s minisign.key -m "$f" -x "$f.minisig"
           done
           rm -f minisign.key
 
