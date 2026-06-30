@@ -11,6 +11,13 @@
 //! should instead dispatch `itasha_crash_capture::is_monitor_invocation` /
 //! `run_monitor_main` from their own `main`; this standalone binary is for hosts
 //! that ship the monitor as a separate executable.
+//!
+//! `run_monitor_main` SURFACES each capture outcome as a structured line on this
+//! process's stderr (which the spawning host captures) and returns a process
+//! exit code that SIGNALS the result: `0` clean, `1` server/IPC run error, `2`
+//! a fail-closed capture failure (LOG-WS-001 / LOG-WS-002). The exit code below
+//! propagates that signal to the host's `wait()` — so a discarded crash report
+//! is no longer silent to the operator or the host.
 
 fn main() {
     let code = itasha_crash_capture::run_monitor_main(std::env::args());

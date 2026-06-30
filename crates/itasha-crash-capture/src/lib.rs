@@ -65,6 +65,8 @@
 //! }
 //! ```
 
+use std::io::Write;
+
 pub mod client;
 pub mod consent;
 pub mod emit;
@@ -97,9 +99,33 @@ pub fn is_monitor_invocation(args: impl IntoIterator<Item = String>) -> bool {
     args.into_iter().any(|a| a == MONITOR_SENTINEL_ARG)
 }
 
+/// Process exit code: a clean monitor run — the loop exited with no capture
+/// failure.
+pub const EXIT_OK: i32 = 0;
+/// Process exit code: the monitor server could not be created or its loop
+/// failed (the IPC bind / server-error path). The monitor never ran a capture.
+pub const EXIT_RUN_ERROR: i32 = 1;
+/// Process exit code: the monitor loop ran but at least one capture genuinely
+/// FAILED (a scrub / spool / delete / write fail-closed). Distinct from
+/// [`EXIT_RUN_ERROR`] so the host can tell "the monitor never ran" from "the
+/// monitor ran but a crash report was discarded" (LOG-WS-002).
+pub const EXIT_CAPTURE_FAILED: i32 = 2;
+
 /// Run the monitor role: parse the `--socket` / `--config-dir` args the client
-/// passed and block on the monitor server loop until one crash is captured.
-/// Returns a process exit code (`0` on clean capture/shutdown, `1` on error).
+/// passed and block on the monitor server loop until one crash is captured,
+/// then SURFACE the recorded [`monitor::CaptureOutcome`]s to the monitor
+/// process's stderr (which the spawning host captures) and SIGNAL the result
+/// through the exit code.
+///
+/// Returns a process exit code: [`EXIT_OK`] on a clean run, [`EXIT_RUN_ERROR`]
+/// if the server could not start, or [`EXIT_CAPTURE_FAILED`] if the loop ran but
+/// a capture failed fail-closed. Before this surfacing existed a fail-closed
+/// capture was computed-then-discarded (LOG-WS-001) and the loop always exited 0
+/// (LOG-WS-002) — silent to both operator and host.
+///
+/// The library crates stay `tracing`-free by design; this surfacing happens
+/// ONLY here, at the out-of-band monitor-PROCESS boundary, as a structured
+/// stderr line carrying COUNTS / ENUMS / sanitized class strings only.
 ///
 /// The host calls this from `main` when [`is_monitor_invocation`] is true.
 #[must_use]
@@ -113,18 +139,61 @@ pub fn run_monitor_main(args: impl IntoIterator<Item = String>) -> i32 {
             .into_owned()
     });
     let shutdown = std::sync::atomic::AtomicBool::new(false);
-    // The `Err(_e) => 1` arm is unit-tested via an unbindable socket (see the
-    // tests below). The `Ok(()) => 0` arm is NOT directly unit-testable: this
-    // entry point constructs its own `shutdown=false` and then blocks in
-    // `run_monitor`'s server loop until a real OS crash drives the handler to
-    // `LoopAction::Exit`, so a clean `Ok` return requires either a genuine
-    // native fault or an externally-set shutdown that this signature does not
-    // expose. The `Ok` path of the underlying `run_monitor` IS covered directly
-    // in `monitor::tests::run_monitor_returns_ok_when_shutdown_already_set`.
     match run_monitor(&socket, config_dir, &shutdown) {
-        Ok(()) => 0,
-        Err(_e) => 1,
+        Ok(outcomes) => surface_outcomes(&outcomes, &mut std::io::stderr().lock()),
+        Err(_e) => {
+            // The IPC server could not be created / the loop failed. Surface a
+            // non-identifying run-error line — NO inner error (it can embed the
+            // socket path / OS errno) — and signal the run-error exit code.
+            let _ = writeln!(
+                std::io::stderr(),
+                "level=error target=w1tn3ss-crash-monitor event=monitor_run_error"
+            );
+            EXIT_RUN_ERROR
+        }
     }
+}
+
+/// Format a single [`monitor::CaptureOutcome`] as a non-identifying, structured
+/// log line for the host-captured monitor sink.
+///
+/// COUNTS / ENUMS / sanitized class strings ONLY — never a spool path, minidump
+/// bytes, OS errno, socket name, or PII. The `MinidumpWritten` spool `path` is
+/// deliberately NOT surfaced; only the scrub counters that prove the
+/// minimization gate ran are emitted. The `CaptureFailed` `reason` is the
+/// already-de-leaked plain-English copy (asserted PII-free by the redaction
+/// tests), surfaced verbatim so the operator learns the failure class.
+fn outcome_log_line(outcome: &monitor::CaptureOutcome) -> String {
+    match outcome {
+        monitor::CaptureOutcome::MinidumpWritten { scrub, .. } => format!(
+            "level=info target=w1tn3ss-crash-monitor event=capture_succeeded \
+             streams_dropped={} modules_coarsened={} bytes_zeroed={}",
+            scrub.streams_dropped, scrub.modules_coarsened, scrub.bytes_zeroed
+        ),
+        monitor::CaptureOutcome::CaptureFailed { reason } => format!(
+            "level=error target=w1tn3ss-crash-monitor event=capture_failed reason={reason:?}"
+        ),
+    }
+}
+
+/// Surface every recorded [`monitor::CaptureOutcome`] to `sink` (the monitor
+/// process's stderr in production, a buffer in tests) and return the process
+/// exit code: [`EXIT_CAPTURE_FAILED`] if ANY outcome is a
+/// [`monitor::CaptureOutcome::CaptureFailed`], else [`EXIT_OK`].
+///
+/// This is the missing surface that previously left every fail-closed capture
+/// result computed-then-discarded (LOG-WS-001) and the loop always exiting 0
+/// (LOG-WS-002). The write is best-effort: a broken stderr pipe must not crash
+/// the monitor nor mask the capture signal the exit code carries.
+fn surface_outcomes<W: Write>(outcomes: &[monitor::CaptureOutcome], sink: &mut W) -> i32 {
+    let mut exit = EXIT_OK;
+    for outcome in outcomes {
+        let _ = writeln!(sink, "{}", outcome_log_line(outcome));
+        if matches!(outcome, monitor::CaptureOutcome::CaptureFailed { .. }) {
+            exit = EXIT_CAPTURE_FAILED;
+        }
+    }
+    exit
 }
 
 /// Extract the value following `flag` in `argv` (e.g. `--socket NAME`).
@@ -215,5 +284,126 @@ mod tests {
         ];
         let code = run_monitor_main(argv);
         assert_eq!(code, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Monitor outcome-surfacing harness (LOG-WS-001 / LOG-WS-002).
+    //
+    // These tests are the capture harness for the monitor process's structured
+    // sink: `surface_outcomes` writes into a `Vec<u8>` buffer we can assert on.
+    // They prove a failed capture is SURFACED (not silent) AND signals a
+    // non-zero exit code, a clean run surfaces success, and NO surfaced line
+    // carries a path byte / errno / crash-content marker / PII.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exit_codes_are_distinct_and_canonical() {
+        assert_eq!(EXIT_OK, 0);
+        assert_eq!(EXIT_RUN_ERROR, 1);
+        assert_eq!(EXIT_CAPTURE_FAILED, 2);
+    }
+
+    #[test]
+    fn surface_outcomes_empty_is_silent_and_ok() {
+        let mut sink: Vec<u8> = Vec::new();
+        let code = surface_outcomes(&[], &mut sink);
+        assert_eq!(code, EXIT_OK);
+        assert!(sink.is_empty(), "no outcomes must surface no lines");
+    }
+
+    #[test]
+    fn surface_outcomes_clean_run_exits_ok() {
+        let outcomes = vec![monitor::CaptureOutcome::MinidumpWritten {
+            path: std::path::PathBuf::from("ignored"),
+            scrub: scrub::ScrubReport {
+                streams_dropped: 2,
+                modules_coarsened: 4,
+                bytes_zeroed: 128,
+            },
+        }];
+        let mut sink: Vec<u8> = Vec::new();
+        let code = surface_outcomes(&outcomes, &mut sink);
+        assert_eq!(code, EXIT_OK);
+        let text = String::from_utf8(sink).unwrap();
+        assert!(text.contains("level=info"));
+        assert!(text.contains("event=capture_succeeded"));
+        // The scrub counters that prove the minimization gate ran ARE surfaced.
+        assert!(text.contains("streams_dropped=2"));
+        assert!(text.contains("modules_coarsened=4"));
+        assert!(text.contains("bytes_zeroed=128"));
+    }
+
+    #[test]
+    fn surface_outcomes_failure_is_surfaced_and_signals_nonzero() {
+        let outcomes = vec![monitor::CaptureOutcome::CaptureFailed {
+            reason: "A crash report could not be created and was discarded.".to_string(),
+        }];
+        let mut sink: Vec<u8> = Vec::new();
+        let code = surface_outcomes(&outcomes, &mut sink);
+        // LOG-WS-002: a failed capture is NO LONGER silent / exit-0.
+        assert_eq!(
+            code, EXIT_CAPTURE_FAILED,
+            "a failed capture must signal a non-zero exit code"
+        );
+        assert_ne!(code, EXIT_OK);
+        let text = String::from_utf8(sink).unwrap();
+        assert!(text.contains("level=error"));
+        assert!(text.contains("event=capture_failed"));
+    }
+
+    /// The no-PII guarantee for the surfaced sink. A success outcome whose spool
+    /// PATH embeds a username, a secret-looking token, and a `.dmp` marker — and
+    /// a fail-closed outcome — are surfaced together; the buffer must carry the
+    /// COUNTS/ENUMS but NONE of the path bytes, PII, errno, or crash-content
+    /// markers. Mirrors the redaction-assert style of the error-copy tests.
+    #[test]
+    fn surfaced_lines_never_leak_path_bytes_or_pii() {
+        let leaky_path = std::path::PathBuf::from(
+            "/home/jane/.config/w1tn3ss/reports/crash-deadbeef-AKIAhunter2.dmp",
+        );
+        let outcomes = vec![
+            monitor::CaptureOutcome::MinidumpWritten {
+                path: leaky_path,
+                scrub: scrub::ScrubReport {
+                    streams_dropped: 3,
+                    modules_coarsened: 7,
+                    bytes_zeroed: 512,
+                },
+            },
+            monitor::CaptureOutcome::CaptureFailed {
+                reason: "A crash report could not be safely cleaned and was \
+                         discarded; nothing was saved or sent."
+                    .to_string(),
+            },
+        ];
+        let mut sink: Vec<u8> = Vec::new();
+        let code = surface_outcomes(&outcomes, &mut sink);
+        let text = String::from_utf8(sink).unwrap();
+
+        // The counts ARE surfaced (proving the gate ran)...
+        assert!(text.contains("streams_dropped=3"));
+        assert!(text.contains("bytes_zeroed=512"));
+        assert!(text.contains("event=capture_succeeded"));
+        assert!(text.contains("event=capture_failed"));
+
+        // ...but NO path byte, PII, errno, spool-dir, or crash-content marker leaks.
+        for banned in [
+            "jane",        // username embedded in the spool path
+            "AKIAhunter2", // secret-looking token embedded in the path
+            ".dmp",        // raw-dump file marker
+            ".config",     // path component
+            "/",           // POSIX path separator
+            "\\",          // Windows path separator
+            "os error",    // errno
+            "reports",     // spool-directory component
+        ] {
+            assert!(
+                !text.contains(banned),
+                "surfaced monitor sink leaked {banned:?}: {text}"
+            );
+        }
+
+        // A genuine capture failure in the batch still signals non-zero.
+        assert_eq!(code, EXIT_CAPTURE_FAILED);
     }
 }

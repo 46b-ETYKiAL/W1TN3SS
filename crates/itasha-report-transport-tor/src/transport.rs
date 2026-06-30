@@ -62,14 +62,61 @@ impl std::fmt::Debug for TorOnionTransport {
 }
 
 /// Result of a single drain pass.
+///
+/// Counts ONLY — never a host, onion address, URL, status text, spool path, or
+/// inner error string. The `retained_*` fields break the `retained` total down
+/// by non-identifying transmit-failure CLASS so the host can tell WHY Tor
+/// delivery is stalling (endpoint rejecting vs. unreachable) without any
+/// identifying detail (LOG-WS-039). Invariant:
+/// `retained == retained_endpoint_rejected + retained_unreachable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DrainReport {
     /// Reports successfully transmitted (and removed from the spool).
     pub sent: usize,
-    /// Reports left in the spool for a later pass (transient failure).
+    /// Reports left in the spool for a later pass (transient failure). Equals
+    /// the sum of the two `retained_*` class counters below.
     pub retained: usize,
     /// Reports dropped as permanently un-sendable (e.g. malformed on disk).
     pub dropped: usize,
+    /// Retained because the endpoint RECEIVED the report but returned a non-2xx
+    /// status (transient server reject). Class token only — the status code is
+    /// deliberately NOT surfaced.
+    pub retained_endpoint_rejected: usize,
+    /// Retained because the endpoint could not be REACHED (connect / timeout /
+    /// transport-layer failure). Class token only — the inner error is
+    /// deliberately NOT surfaced.
+    pub retained_unreachable: usize,
+}
+
+/// The non-identifying CLASS of a single transmit attempt — the coarse
+/// disposition the drain surfaces to the host. Never carries a status code,
+/// host, URL, or inner error string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransmitDisposition {
+    /// 2xx — accepted; the spool file is removed.
+    Sent,
+    /// The endpoint received the report but returned a non-2xx status; the
+    /// report is retained for a later pass.
+    RetainedEndpointRejected,
+    /// The endpoint could not be reached (connect / timeout / transport
+    /// failure); the report is retained for a later pass.
+    RetainedUnreachable,
+}
+
+/// Classify one transmit result into its non-identifying [`TransmitDisposition`].
+///
+/// Pure + deterministic so the class mapping is unit-tested WITHOUT a live Tor
+/// network. The inner `Rejected(code)` / [`SendError`] detail is intentionally
+/// NOT inspected here — only the coarse, non-identifying class is surfaced,
+/// which is the whole point of LOG-WS-039: an operator learns the failure CLASS
+/// without any identifying status text, host, or errno reaching the report.
+#[must_use]
+fn classify_transmit(result: &Result<HttpOutcome, SendError>) -> TransmitDisposition {
+    match result {
+        Ok(HttpOutcome::Accepted) => TransmitDisposition::Sent,
+        Ok(HttpOutcome::Rejected(_)) => TransmitDisposition::RetainedEndpointRejected,
+        Err(_) => TransmitDisposition::RetainedUnreachable,
+    }
 }
 
 impl TorOnionTransport {
@@ -204,7 +251,11 @@ impl TorOnionTransport {
     /// be loaded/built is dropped (it can never succeed).
     ///
     /// Call this from the host's background async worker. It is safe to call
-    /// repeatedly; each call is one pass over the current spool contents.
+    /// repeatedly; each call is one pass over the current spool contents. The
+    /// returned [`DrainReport`] breaks `retained` down by non-identifying
+    /// transmit-failure CLASS (`retained_endpoint_rejected` /
+    /// `retained_unreachable`) so the host can surface WHY delivery is stalling
+    /// without any identifying status, host, or error detail (LOG-WS-039).
     pub async fn drain_spool(&self) -> Result<DrainReport, SendError> {
         let mut report = DrainReport::default();
         let paths = self.spool.list().map_err(|_e| {
@@ -233,14 +284,23 @@ impl TorOnionTransport {
                     continue;
                 }
             };
-            match self.transmit(&body).await {
-                Ok(HttpOutcome::Accepted) => {
+            // Classify the attempt into a non-identifying CLASS, then record it.
+            // A non-2xx (endpoint reached, rejected) and an unreachable endpoint
+            // are BOTH retained for a later pass, but the host learns WHICH class
+            // via the `retained_*` counters — never the status code or inner
+            // error (LOG-WS-039).
+            match classify_transmit(&self.transmit(&body).await) {
+                TransmitDisposition::Sent => {
                     let _ = self.spool.remove(&path);
                     report.sent += 1;
                 }
-                // 4xx/5xx or transport failure → retain for a later pass.
-                Ok(HttpOutcome::Rejected(_)) | Err(_) => {
+                TransmitDisposition::RetainedEndpointRejected => {
                     report.retained += 1;
+                    report.retained_endpoint_rejected += 1;
+                }
+                TransmitDisposition::RetainedUnreachable => {
+                    report.retained += 1;
+                    report.retained_unreachable += 1;
                 }
             }
         }
@@ -417,6 +477,91 @@ mod tests {
         assert_eq!(report.dropped, 1);
         assert_eq!(t.spool().count().unwrap(), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Transmit-failure CLASS surfacing (LOG-WS-039). `classify_transmit` is the
+    // pure, network-free seam that maps a transmit result to the non-identifying
+    // class the drain records. These prove every disposition maps correctly, the
+    // `DrainReport` invariant holds, and NO class surface leaks an identifier.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_transmit_maps_accepted_to_sent() {
+        let r: Result<HttpOutcome, SendError> = Ok(HttpOutcome::Accepted);
+        assert_eq!(classify_transmit(&r), TransmitDisposition::Sent);
+    }
+
+    #[test]
+    fn classify_transmit_maps_non_2xx_to_endpoint_rejected() {
+        // A 4xx and a 5xx both classify as "endpoint received it, rejected it" —
+        // the status CODE is never inspected, only the coarse class.
+        for code in [400u16, 413, 429, 500, 503] {
+            let r: Result<HttpOutcome, SendError> = Ok(HttpOutcome::Rejected(code));
+            assert_eq!(
+                classify_transmit(&r),
+                TransmitDisposition::RetainedEndpointRejected,
+                "status {code} must classify as endpoint-rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_transmit_maps_transport_error_to_unreachable() {
+        let r: Result<HttpOutcome, SendError> = Err(SendError::Transport(
+            "Could not reach the private endpoint; the report will be retried later.".to_string(),
+        ));
+        assert_eq!(
+            classify_transmit(&r),
+            TransmitDisposition::RetainedUnreachable
+        );
+    }
+
+    #[test]
+    fn drain_report_retained_classes_sum_to_retained() {
+        // The invariant the host relies on: the two non-identifying class
+        // counters partition `retained` exactly.
+        let report = DrainReport {
+            sent: 5,
+            retained: 7,
+            dropped: 2,
+            retained_endpoint_rejected: 3,
+            retained_unreachable: 4,
+        };
+        assert_eq!(
+            report.retained,
+            report.retained_endpoint_rejected + report.retained_unreachable
+        );
+    }
+
+    /// The class surface is counts/enums ONLY. The `Debug` of a populated
+    /// `DrainReport` (the natural host log form) must carry NO path separator,
+    /// errno, host, onion address, or status text — only field names + digits.
+    #[test]
+    fn drain_report_class_surface_never_leaks_identifiers() {
+        let report = DrainReport {
+            sent: 1,
+            retained: 2,
+            dropped: 0,
+            retained_endpoint_rejected: 1,
+            retained_unreachable: 1,
+        };
+        let shown = format!("{report:?}");
+        for banned in [
+            "/", "\\",       // path separators
+            "os error", // errno
+            ".onion", "onion", // endpoint identifiers
+            "http", "503", "429", "400", // status / protocol detail
+            "arti", "tor", // transport identifiers
+        ] {
+            assert!(
+                !shown.to_lowercase().contains(banned),
+                "DrainReport surface leaked {banned:?}: {shown}"
+            );
+        }
+        // The class counts ARE present (the whole point — the host can see them).
+        assert!(shown.contains("retained_endpoint_rejected"));
+        assert!(shown.contains("retained_unreachable"));
     }
 
     #[test]
