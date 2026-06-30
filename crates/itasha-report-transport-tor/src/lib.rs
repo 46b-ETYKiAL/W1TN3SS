@@ -52,12 +52,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod arti_connector;
 pub mod config;
+pub mod connector;
 pub mod http;
 pub mod hygiene;
 pub mod transport;
 
+pub use arti_connector::ArtiConnector;
 pub use config::TorTransportConfig;
+pub use connector::{BoxedOnionStream, OnionConnector, OnionStream};
 pub use transport::TorOnionTransport;
 
 /// The crate / transport name (diagnostics only — never sent on the wire; the

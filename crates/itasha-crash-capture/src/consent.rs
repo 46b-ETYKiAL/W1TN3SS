@@ -22,6 +22,8 @@
 //! Tier-1 `ConsentToken`, but as an independent, non-interchangeable type so
 //! the two streams can never be conflated under one toggle.
 
+use itasha_report_core::consent::ephemeral_nonce;
+
 /// The default heightened-consent disclosure string.
 ///
 /// Hosts (e.g. the SCR1B3 consent dialog, plan-732) render this — or an
@@ -66,7 +68,7 @@ impl Tier2ConsentToken {
     #[must_use]
     pub fn granted_with_disclosure(disclosure: impl Into<String>) -> Self {
         Self {
-            nonce: generate_ephemeral_nonce(),
+            nonce: ephemeral_nonce(),
             disclosure: disclosure.into(),
         }
     }
@@ -86,26 +88,17 @@ impl Tier2ConsentToken {
     }
 }
 
-/// Generate a fresh, non-identifying nonce.
-///
-/// Uses process-local time-and-counter entropy — deliberately NOT a stable
-/// machine fingerprint, MAC address, or install id. Two calls always differ;
-/// the value reveals nothing about the host machine. (Mirrors
-/// `itasha-report-core`'s Tier-1 nonce generator so both streams share the
-/// same no-persistent-id guarantee.)
-fn generate_ephemeral_nonce() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{nanos:x}-{seq:x}")
-}
+// The ephemeral per-capture nonce is minted by `itasha-report-core`'s single
+// canonical `ephemeral_nonce` generator (imported at the top of this module),
+// NOT a second, divergent copy.
+//
+// This crate previously had its own `SystemTime::now()`-nanos + `AtomicU64`
+// counter generator. That form was both time-orderable AND sequence-orderable —
+// exactly the linkage primitive that report-core's gap-D-2 hardening removed —
+// so the Tier-2 stream silently regressed below the Tier-1 unlinkability bar
+// while its doc-comment claimed it "mirrors" the core generator. Reusing the
+// one CSPRNG implementation makes that claim literally true and structurally
+// prevents the two streams from drifting apart again.
 
 #[cfg(test)]
 mod tests {
@@ -144,6 +137,27 @@ mod tests {
         let a = Tier2ConsentToken::granted();
         let b = Tier2ConsentToken::granted();
         assert_ne!(a.nonce(), b.nonce());
+    }
+
+    #[test]
+    fn nonce_is_the_unlinkable_csprng_shape_not_a_time_counter() {
+        // Regression guard for the gap-D-2 divergence: the Tier-2 nonce MUST be
+        // the same unlinkable 32-lowercase-hex CSPRNG shape as report-core's
+        // Tier-1 nonce. The old `{nanos:x}-{seq:x}` form carried a `-`
+        // separator, was variable-length, and was time/sequence-orderable — all
+        // of which these assertions reject.
+        for _ in 0..256 {
+            let nonce = Tier2ConsentToken::granted().nonce().to_string();
+            assert_eq!(
+                nonce.len(),
+                32,
+                "nonce must be 32 hex chars (128 bits), got {nonce:?}"
+            );
+            assert!(
+                nonce.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "nonce must be pure lowercase hex (no '-' separator, no time/seq structure), got {nonce:?}"
+            );
+        }
     }
 
     #[test]

@@ -7,15 +7,19 @@
 //!    [`itasha_report_core::spool::Spool`]). It returns immediately —
 //!    fire-and-forget — so Tor bootstrap/connect latency never blocks the app.
 //! 2. A background drain ([`TorOnionTransport::drain_spool`]) walks the spool,
-//!    applies send-time jitter, lazily bootstraps the embedded Arti
-//!    [`arti_client::TorClient`] on first use, connects to the config-injected
-//!    `.onion`, and POSTs the padded envelope over the [`crate::http`] client.
-//!    On a 2xx the report is removed; otherwise it is left for a later pass
-//!    (capped, backed-off retry).
+//!    applies send-time jitter, asks the [`crate::connector::OnionConnector`]
+//!    for a duplex stream to the config-injected `.onion`, and POSTs the padded
+//!    envelope over the [`crate::http`] client. On a 2xx the report is removed;
+//!    on a transient failure it is retried with capped, exponential backoff
+//!    ([`crate::config::RetryPolicy`]) up to `max_attempts` and then left for a
+//!    later pass; a 4xx or un-loadable report is not retried.
 //!
-//! The embedded `TorClient` is created with `BootstrapBehavior::OnDemand`, so
-//! the directory consensus is fetched on the first connect, not at app launch.
-//! The Arti state/cache dirs persist the consensus so warm bootstraps are fast.
+//! The live Tor dependency is confined to the [`crate::connector`] seam: the
+//! production [`crate::connector::ArtiConnector`] bootstraps the embedded Arti
+//! [`arti_client::TorClient`] lazily (`OnDemand`) and dials the onion. Because
+//! the transport holds the connector as a trait object, the whole drain
+//! orchestration is unit-tested offline over a `tokio::io::duplex` pipe; only
+//! the un-mockable Arti bootstrap+connect stays outside the measured surface.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +30,9 @@ use itasha_report_core::envelope::Envelope;
 use itasha_report_core::report::Report;
 use itasha_report_core::spool::Spool;
 
+use crate::arti_connector::ArtiConnector;
 use crate::config::TorTransportConfig;
+use crate::connector::OnionConnector;
 use crate::http::{post_envelope, HttpOutcome};
 use crate::hygiene::{pad_envelope_bytes, sample_jitter};
 
@@ -40,16 +46,11 @@ use crate::hygiene::{pad_envelope_bytes, sample_jitter};
 pub struct TorOnionTransport {
     config: TorTransportConfig,
     spool: Spool,
-    /// Lazily-bootstrapped embedded Arti client, shared across drains.
-    ///
-    /// `TorClient` is not `Clone`, so it is shared behind an `Arc`. `connect`
-    /// takes `&self`, so the `Arc` is all we need.
-    tor: Arc<tokio::sync::Mutex<Option<Arc<ArtiHandle>>>>,
+    /// The onion-connection seam (the live Tor dependency). Production wiring
+    /// uses [`ArtiConnector`]; tests inject an in-memory connector. Held behind
+    /// an `Arc` so the transport stays `Clone` and connectors are shareable.
+    connector: Arc<dyn OnionConnector>,
 }
-
-/// Opaque handle to the embedded Arti client (kept behind an alias so the
-/// public API does not leak Arti types).
-type ArtiHandle = arti_client::TorClient<tor_rtcompat::PreferredRuntime>;
 
 impl std::fmt::Debug for TorOnionTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -127,13 +128,36 @@ impl TorOnionTransport {
         config: TorTransportConfig,
         config_dir: impl Into<PathBuf>,
     ) -> Result<Self, SendError> {
+        let connector = Arc::new(ArtiConnector::new(
+            config.state_dir.clone(),
+            config.cache_dir.clone(),
+        ));
+        Self::with_connector(config, config_dir, connector)
+    }
+
+    /// Construct the transport over a caller-supplied [`OnionConnector`].
+    ///
+    /// This is the dependency-injection seam: production code uses [`new`] (which
+    /// wires an [`ArtiConnector`]); tests inject an in-memory connector over a
+    /// `tokio::io::duplex` pipe so the spool-drain orchestration is exercised
+    /// with no live `.onion`. Returns an error only if the spool directory cannot
+    /// be created.
+    ///
+    /// [`new`]: TorOnionTransport::new
+    pub fn with_connector(
+        config: TorTransportConfig,
+        config_dir: impl Into<PathBuf>,
+        connector: Arc<dyn OnionConnector>,
+    ) -> Result<Self, SendError> {
+        // Redacted, non-identifying failure copy (LOG-WS-039): no path, errno,
+        // or spool detail reaches the host-visible surface.
         let spool = Spool::open(config_dir.into()).map_err(|_e| {
             SendError::Transport("Reports could not be saved on this device.".to_string())
         })?;
         Ok(Self {
             config,
             spool,
-            tor: Arc::new(tokio::sync::Mutex::new(None)),
+            connector,
         })
     }
 
@@ -168,43 +192,16 @@ impl TorOnionTransport {
         Ok(pad_envelope_bytes(&envelope, &self.config.padding_buckets))
     }
 
-    /// Lazily bootstrap (or reuse) the embedded Arti client. The first call
-    /// builds the client with `OnDemand` bootstrap behaviour; subsequent calls
-    /// reuse the cached handle.
-    async fn tor_client(&self) -> Result<Arc<ArtiHandle>, SendError> {
-        let mut guard = self.tor.lock().await;
-        if let Some(client) = guard.as_ref() {
-            return Ok(Arc::clone(client));
-        }
-        let cfg = build_arti_config(&self.config.state_dir, &self.config.cache_dir)?;
-        let client = arti_client::TorClient::builder()
-            .config(cfg)
-            .bootstrap_behavior(arti_client::BootstrapBehavior::OnDemand)
-            .create_unbootstrapped()
-            .map_err(|_e| {
-                SendError::Transport(
-                    "The private network could not start; the report will be retried later."
-                        .to_string(),
-                )
-            })?;
-        // `create_unbootstrapped` already yields an `Arc<TorClient>`.
-        *guard = Some(Arc::clone(&client));
-        Ok(client)
-    }
-
-    /// Transmit one already-padded envelope blob over Tor to the onion endpoint.
-    /// Applies send-time jitter, connects, and POSTs. Returns the HTTP outcome.
+    /// Transmit one already-padded envelope blob over Tor to the onion endpoint:
+    /// ask the connector for a stream and POST. This is **one** attempt — the
+    /// send-time jitter and the retry/backoff are the caller's
+    /// ([`transmit_with_retry`](Self::transmit_with_retry)) responsibility.
     async fn transmit(&self, body: &[u8]) -> Result<HttpOutcome, SendError> {
-        // 1. Send-time jitter (decouple crash-time from send-time).
-        let delay = sample_jitter(self.config.jitter.min, self.config.jitter.max);
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-
-        // 2. Lazily bootstrap + connect to the onion:port.
-        let client = self.tor_client().await?;
-        let addr = (self.config.onion_address.as_str(), self.config.onion_port);
-        let connect = client.connect(addr);
+        // Connect to the onion:port via the seam (Arti in production, an
+        // in-memory pipe in tests), bounded by the per-attempt timeout.
+        let connect = self
+            .connector
+            .connect(&self.config.onion_address, self.config.onion_port);
         let mut stream = tokio::time::timeout(self.config.timeout, connect)
             .await
             .map_err(|_| {
@@ -220,7 +217,7 @@ impl TorOnionTransport {
                 )
             })?;
 
-        // 3. POST the envelope over the DataStream (fixed-minimal headers).
+        // POST the envelope over the stream (fixed-minimal headers).
         let post = post_envelope(
             &mut stream,
             &self.config.onion_address,
@@ -247,8 +244,10 @@ impl TorOnionTransport {
 
     /// Drain the spool over Tor: for each spooled report, build its padded
     /// envelope and transmit. On a 2xx the report file is removed; on a
-    /// transient failure it is retained for a later pass; a report that cannot
-    /// be loaded/built is dropped (it can never succeed).
+    /// transient failure the report is retried with capped exponential backoff
+    /// ([`crate::config::RetryPolicy`]) up to `max_attempts` within this pass and
+    /// then retained for a later pass; a report that cannot be loaded/built is
+    /// dropped (it can never succeed).
     ///
     /// Call this from the host's background async worker. It is safe to call
     /// repeatedly; each call is one pass over the current spool contents. The
@@ -284,12 +283,13 @@ impl TorOnionTransport {
                     continue;
                 }
             };
-            // Classify the attempt into a non-identifying CLASS, then record it.
-            // A non-2xx (endpoint reached, rejected) and an unreachable endpoint
+            // Retry transient failures with capped backoff, then classify the
+            // TERMINAL attempt into a non-identifying CLASS and record it. A
+            // non-2xx (endpoint reached, rejected) and an unreachable endpoint
             // are BOTH retained for a later pass, but the host learns WHICH class
             // via the `retained_*` counters — never the status code or inner
             // error (LOG-WS-039).
-            match classify_transmit(&self.transmit(&body).await) {
+            match classify_transmit(&self.transmit_with_retry(&body).await) {
                 TransmitDisposition::Sent => {
                     let _ = self.spool.remove(&path);
                     report.sent += 1;
@@ -305,6 +305,59 @@ impl TorOnionTransport {
             }
         }
         Ok(report)
+    }
+
+    /// Transmit one payload with send-time jitter and the configured retry
+    /// policy. Jitter is applied **once** up-front (its purpose is to decouple
+    /// crash-time from send-time — a per-report concern, not a per-attempt one;
+    /// the backoff already decorrelates retries). Then transient failures (a
+    /// connect/IO/transport error or a 5xx) are retried with capped exponential
+    /// backoff up to `retry.max_attempts` before the report is retained. A 4xx is
+    /// a permanent client-side rejection (malformed/oversize/forbidden) that a
+    /// retry cannot fix, so it is retained immediately without burning attempts.
+    ///
+    /// Returns the **terminal** attempt's result so the caller can classify it
+    /// into a non-identifying [`TransmitDisposition`] (LOG-WS-039): a 2xx is
+    /// `Sent`, a non-2xx is endpoint-rejected, a connect/transport error is
+    /// unreachable.
+    async fn transmit_with_retry(&self, body: &[u8]) -> Result<HttpOutcome, SendError> {
+        // Send-time jitter, once per report — NOT once per retry attempt, so a
+        // briefly-down endpoint cannot stall the sequential drain on repeated
+        // jitter sleeps.
+        let delay = sample_jitter(self.config.jitter.min, self.config.jitter.max);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+
+        let policy = self.config.retry;
+        let max_attempts = policy.max_attempts.max(1);
+        let mut attempt: u32 = 1;
+        loop {
+            let result = self.transmit(body).await;
+            match &result {
+                Ok(HttpOutcome::Accepted) => return result,
+                // 4xx: permanent client error — retrying is pointless. Return it
+                // (a later code/server change may make it sendable) but do not
+                // consume retry attempts on it.
+                Ok(HttpOutcome::Rejected(code)) if (400..500).contains(code) => {
+                    return result;
+                }
+                // 5xx (server transient) or a transport/connect error: retry
+                // until the attempt budget is exhausted, then return the last
+                // result for the caller to classify and retain.
+                Ok(HttpOutcome::Rejected(_)) | Err(_) => {
+                    if attempt >= max_attempts {
+                        return result;
+                    }
+                    // Backoff for THIS attempt before the next one, then advance.
+                    let backoff = policy.backoff_for(attempt);
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
+                    attempt += 1;
+                }
+            }
+        }
     }
 }
 
@@ -324,22 +377,6 @@ impl IngestBackend for TorOnionTransport {
             )),
         }
     }
-}
-
-/// Build the Arti `TorClientConfig` pointing storage at the app's state/cache
-/// dirs. Persisting the consensus cache makes warm bootstraps fast.
-fn build_arti_config(
-    state_dir: &std::path::Path,
-    cache_dir: &std::path::Path,
-) -> Result<arti_client::TorClientConfig, SendError> {
-    arti_client::config::TorClientConfigBuilder::from_directories(state_dir, cache_dir)
-        .build()
-        .map_err(|_e| {
-            SendError::Transport(
-                "The private network could not be configured; the report will be retried later."
-                    .to_string(),
-            )
-        })
 }
 
 /// Derive a 32-hex Sentry `event_id` from the ephemeral consent nonce
@@ -573,6 +610,272 @@ mod tests {
         assert!(t.config().is_valid_onion());
         assert_eq!(t.config().jitter, JitterBounds::none());
         let _ = Duration::from_secs(1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ----------------------------------------------------------------------
+    // Offline drain tests over an injected in-memory connector.
+    //
+    // These exercise the FULL spool-drain orchestration — retry/backoff
+    // bookkeeping, the sent/retain accounting, and the padded envelope landing
+    // on the wire — with NO live `.onion`. The `ScriptedConnector` returns a
+    // `tokio::io::duplex` pair whose server end speaks just enough HTTP/1.1 to
+    // ack/reject (Content-Length-aware), or fails the connect outright. This is
+    // the seam ADR-0002 named as the removal trigger for the `transport.rs`
+    // coverage exclusion.
+    // ----------------------------------------------------------------------
+
+    use crate::config::RetryPolicy;
+    use crate::connector::{BoxedOnionStream, ConnectFuture, OnionConnector};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    /// What a single `connect` call does.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// The connect itself fails (a transport/circuit error).
+        Fail,
+        /// Connect succeeds; the server replies with this status code.
+        Serve(u16),
+    }
+
+    struct ScriptInner {
+        script: Mutex<VecDeque<Step>>,
+        /// Used once the scripted steps are exhausted (models a steady state,
+        /// e.g. "always fails" or "always 200").
+        default: Step,
+        attempts: AtomicUsize,
+        /// The request body bytes the server saw on the most recent serve.
+        last_body: Mutex<Option<Vec<u8>>>,
+    }
+
+    /// A test [`OnionConnector`] backed by in-memory duplex pipes.
+    #[derive(Clone)]
+    struct ScriptedConnector {
+        inner: Arc<ScriptInner>,
+    }
+
+    impl ScriptedConnector {
+        fn new(default: Step, steps: impl IntoIterator<Item = Step>) -> Self {
+            Self {
+                inner: Arc::new(ScriptInner {
+                    script: Mutex::new(steps.into_iter().collect()),
+                    default,
+                    attempts: AtomicUsize::new(0),
+                    last_body: Mutex::new(None),
+                }),
+            }
+        }
+        fn attempts(&self) -> usize {
+            self.inner.attempts.load(Ordering::SeqCst)
+        }
+        fn last_body_len(&self) -> Option<usize> {
+            self.inner.last_body.lock().unwrap().as_ref().map(Vec::len)
+        }
+    }
+
+    impl OnionConnector for ScriptedConnector {
+        fn connect(&self, _onion_address: &str, _onion_port: u16) -> ConnectFuture<'_> {
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                inner.attempts.fetch_add(1, Ordering::SeqCst);
+                let step = {
+                    let mut q = inner.script.lock().unwrap();
+                    q.pop_front().unwrap_or(inner.default)
+                };
+                match step {
+                    Step::Fail => Err(SendError::Transport("mock connect failed".to_string())),
+                    Step::Serve(code) => {
+                        let (client, server) = tokio::io::duplex(64 * 1024);
+                        let inner2 = Arc::clone(&inner);
+                        tokio::spawn(async move { serve_once(server, code, &inner2).await });
+                        Ok(Box::new(client) as BoxedOnionStream)
+                    }
+                }
+            })
+        }
+    }
+
+    fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    }
+
+    fn parse_content_length(headers: &[u8]) -> usize {
+        let text = String::from_utf8_lossy(headers);
+        for line in text.split("\r\n") {
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    return v.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        0
+    }
+
+    /// Read one request (headers + Content-Length body), record the body, and
+    /// reply with `code`.
+    async fn serve_once(mut server: DuplexStream, code: u16, inner: &ScriptInner) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let header_end = loop {
+            match server.read(&mut chunk).await {
+                Ok(0) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => return,
+            }
+            if let Some(end) = find_crlf_crlf(&buf) {
+                break end;
+            }
+            if buf.len() > 1_000_000 {
+                return;
+            }
+        };
+        let want = header_end + parse_content_length(&buf[..header_end]);
+        while buf.len() < want {
+            match server.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let body = buf[header_end..want.min(buf.len())].to_vec();
+        *inner.last_body.lock().unwrap() = Some(body);
+        let resp = format!("HTTP/1.1 {code} X\r\nContent-Length: 0\r\n\r\n");
+        let _ = server.write_all(resp.as_bytes()).await;
+        let _ = server.flush().await;
+    }
+
+    /// A retry policy with negligible backoff so the retry-path tests run fast
+    /// while still proving the policy is consulted.
+    fn fast_retry(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            base_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(5),
+        }
+    }
+
+    fn transport_with(
+        dir: &std::path::Path,
+        config: TorTransportConfig,
+        connector: ScriptedConnector,
+    ) -> (TorOnionTransport, ScriptedConnector) {
+        let t =
+            TorOnionTransport::with_connector(config, dir, Arc::new(connector.clone())).unwrap();
+        (t, connector)
+    }
+
+    #[tokio::test]
+    async fn drain_sends_over_injected_connector_and_pads_on_the_wire() {
+        let dir = tmp_dir("drain-ok");
+        let conn = ScriptedConnector::new(Step::Serve(200), []);
+        let (t, conn) = transport_with(&dir, cfg(&dir), conn);
+
+        t.send(&Report::crash("boom"), &ConsentToken::granted())
+            .unwrap();
+        assert_eq!(t.spool().count().unwrap(), 1);
+
+        let report = t.drain_spool().await.unwrap();
+        assert_eq!(
+            report,
+            DrainReport {
+                sent: 1,
+                ..DrainReport::default()
+            }
+        );
+        // Sent ⇒ removed from the spool.
+        assert_eq!(t.spool().count().unwrap(), 0);
+        assert_eq!(conn.attempts(), 1, "a clean 200 takes exactly one attempt");
+        // The padded envelope (default first bucket = 4 KiB) reached the wire.
+        assert_eq!(conn.last_body_len(), Some(4096));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn drain_retries_transient_failure_then_succeeds() {
+        let dir = tmp_dir("drain-retry");
+        // First connect fails (transient), the next serves 200.
+        let conn = ScriptedConnector::new(Step::Serve(200), [Step::Fail]);
+        let config = cfg(&dir).with_retry(fast_retry(3));
+        let (t, conn) = transport_with(&dir, config, conn);
+
+        t.send(&Report::crash("boom"), &ConsentToken::granted())
+            .unwrap();
+        let report = t.drain_spool().await.unwrap();
+
+        assert_eq!(report.sent, 1);
+        assert_eq!(t.spool().count().unwrap(), 0);
+        // Exactly two attempts: the failed one + the successful retry.
+        assert_eq!(conn.attempts(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn drain_retains_after_exhausting_attempts() {
+        let dir = tmp_dir("drain-exhaust");
+        // Connect always fails.
+        let conn = ScriptedConnector::new(Step::Fail, []);
+        let config = cfg(&dir).with_retry(fast_retry(3));
+        let (t, conn) = transport_with(&dir, config, conn);
+
+        t.send(&Report::crash("boom"), &ConsentToken::granted())
+            .unwrap();
+        let report = t.drain_spool().await.unwrap();
+
+        // Connect always fails ⇒ the terminal attempt is unreachable, so the
+        // non-identifying class breakdown attributes it to `retained_unreachable`.
+        assert_eq!(
+            report,
+            DrainReport {
+                sent: 0,
+                retained: 1,
+                dropped: 0,
+                retained_endpoint_rejected: 0,
+                retained_unreachable: 1,
+            }
+        );
+        // Retained ⇒ still on the spool for a later pass.
+        assert_eq!(t.spool().count().unwrap(), 1);
+        // The policy cap was honoured exactly.
+        assert_eq!(conn.attempts(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn drain_does_not_retry_a_4xx_client_error() {
+        let dir = tmp_dir("drain-4xx");
+        // A 413 (payload too large) is permanent — retrying cannot fix it.
+        let conn = ScriptedConnector::new(Step::Serve(413), []);
+        let config = cfg(&dir).with_retry(fast_retry(5));
+        let (t, conn) = transport_with(&dir, config, conn);
+
+        t.send(&Report::crash("boom"), &ConsentToken::granted())
+            .unwrap();
+        let report = t.drain_spool().await.unwrap();
+
+        assert_eq!(report.retained, 1);
+        assert_eq!(t.spool().count().unwrap(), 1);
+        // No retry budget burned on a permanent 4xx.
+        assert_eq!(conn.attempts(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn drain_retries_a_5xx_server_error() {
+        let dir = tmp_dir("drain-5xx");
+        // 503 is a transient server error — it IS retried.
+        let conn = ScriptedConnector::new(Step::Serve(503), []);
+        let config = cfg(&dir).with_retry(fast_retry(2));
+        let (t, conn) = transport_with(&dir, config, conn);
+
+        t.send(&Report::crash("boom"), &ConsentToken::granted())
+            .unwrap();
+        let report = t.drain_spool().await.unwrap();
+
+        assert_eq!(report.retained, 1);
+        assert_eq!(conn.attempts(), 2, "5xx is transient and consumes retries");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

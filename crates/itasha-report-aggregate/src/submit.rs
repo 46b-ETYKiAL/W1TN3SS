@@ -241,4 +241,50 @@ mod tests {
         )
         .unwrap();
     }
+
+    /// A transport that always fails, to exercise the `SendError → SubmitError`
+    /// conversion that `RecordingTransport` (always-`Ok`) cannot reach.
+    struct FailingTransport;
+
+    impl IngestBackend for FailingTransport {
+        fn send(
+            &self,
+            _report: &Report,
+            _consent: &ConsentToken,
+        ) -> Result<SendOutcome, SendError> {
+            Err(SendError::Transport("simulated onion down".to_string()))
+        }
+    }
+
+    #[test]
+    fn transport_failure_surfaces_as_submit_error_transport() {
+        let producer = StarProducer::new("2026-W25").unwrap();
+        let err = submit_over_transport(
+            &producer,
+            &measurement(),
+            &FailingTransport,
+            &AggregateConsentToken::granted(),
+            &ConsentToken::granted(),
+        )
+        .unwrap_err();
+
+        // The `?` on `transport.send(...)` routes the SendError through
+        // `From<SendError> for SubmitError` into the Transport variant…
+        assert!(
+            matches!(err, SubmitError::Transport(SendError::Transport(_))),
+            "expected SubmitError::Transport, got {err:?}"
+        );
+        // …and the Display impl surfaces a fixed, non-identifying class string:
+        // no tier/protocol jargon and — crucially — the inner error reason is
+        // NEVER interpolated, so a transport-layer detail cannot leak to the host.
+        let shown = err.to_string();
+        assert_eq!(
+            shown, "The anonymous signal could not be sent right now; it will be retried later.",
+            "got {shown:?}"
+        );
+        assert!(
+            !shown.contains("simulated onion down"),
+            "inner transport detail leaked to the host surface: {shown:?}"
+        );
+    }
 }

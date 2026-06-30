@@ -30,7 +30,7 @@ impl ConsentToken {
     #[must_use]
     pub fn granted() -> Self {
         Self {
-            nonce: generate_ephemeral_nonce(),
+            nonce: ephemeral_nonce(),
         }
     }
 
@@ -46,7 +46,14 @@ impl ConsentToken {
 /// CSPRNG entropy → collision-free in practice and unlinkable by construction.
 const NONCE_BYTES: usize = 16;
 
-/// Generate a fresh, non-identifying, **unlinkable** nonce.
+/// Generate a fresh, non-identifying, **unlinkable** ephemeral nonce — the
+/// single SDK-wide nonce generator shared by every W1TN3SS consent stream.
+///
+/// This is the **one** canonical implementation. The Tier-2 heightened-consent
+/// token in the sibling `itasha-crash-capture` crate calls straight into this
+/// function, so both streams are guaranteed to carry the identical unlinkable
+/// nonce shape (32 lowercase-hex chars) — there is no second, divergent copy to
+/// drift out of sync.
 ///
 /// Anonymity hardening #1 (gap D-2): the nonce is `NONCE_BYTES` of OS-CSPRNG
 /// output, hex-encoded. There is **no time component and no monotonic counter**
@@ -57,7 +64,8 @@ const NONCE_BYTES: usize = 16;
 /// not ordered, not adjacent, and not correlated. It is still ephemeral
 /// (per-report, used once for de-dup then discarded) and deliberately NOT a
 /// stable machine fingerprint, MAC, or install id.
-fn generate_ephemeral_nonce() -> String {
+#[must_use]
+pub fn ephemeral_nonce() -> String {
     use rand::RngCore;
 
     let mut bytes = [0u8; NONCE_BYTES];
