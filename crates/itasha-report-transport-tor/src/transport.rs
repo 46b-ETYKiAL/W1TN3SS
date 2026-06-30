@@ -261,7 +261,20 @@ impl TorOnionTransport {
             SendError::Transport("Saved reports could not be read from this device.".to_string())
         })?;
 
+        // Wall-clock budget for this pass (tokio clock so it is testable under
+        // paused time). `None` = unbounded.
+        let pass_start = tokio::time::Instant::now();
         for path in paths {
+            // Per-pass budget: stop STARTING new reports once the pass has run
+            // for `max_pass_duration`, leaving the remainder spooled for the next
+            // pass. The in-flight report (if any) already completed above; this
+            // gates only whether the NEXT one starts, so an unreachable onion
+            // cannot turn one pass into a multi-hour run on a large spool.
+            if let Some(budget) = self.config.max_pass_duration {
+                if pass_start.elapsed() >= budget {
+                    break;
+                }
+            }
             // Load the spooled Report.
             let loaded = match self.spool.load(&path) {
                 Ok(r) => r,
@@ -876,6 +889,32 @@ mod tests {
 
         assert_eq!(report.retained, 1);
         assert_eq!(conn.attempts(), 2, "5xx is transient and consumes retries");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn drain_pass_budget_stops_before_starting_reports() {
+        // A zero per-pass budget means the deadline is already reached at the top
+        // of the drain loop, so NO report is started this pass: the connector is
+        // never dialed and every report stays spooled for the next pass. (The
+        // unbounded default `None` path is exercised by every other drain test.)
+        let dir = tmp_dir("drain-budget");
+        let conn = ScriptedConnector::new(Step::Serve(200), []);
+        let config = cfg(&dir).with_max_pass_duration(Some(Duration::ZERO));
+        let (t, conn) = transport_with(&dir, config, conn);
+
+        t.send(&Report::crash("a"), &ConsentToken::granted())
+            .unwrap();
+        t.send(&Report::crash("b"), &ConsentToken::granted())
+            .unwrap();
+        assert_eq!(t.spool().count().unwrap(), 2);
+
+        let report = t.drain_spool().await.unwrap();
+        // Nothing started ⇒ all counters zero, both reports still spooled, and the
+        // onion was never dialed.
+        assert_eq!(report, DrainReport::default());
+        assert_eq!(t.spool().count().unwrap(), 2);
+        assert_eq!(conn.attempts(), 0, "the budget must gate BEFORE dialing");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

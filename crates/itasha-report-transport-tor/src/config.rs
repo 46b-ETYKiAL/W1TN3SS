@@ -132,6 +132,15 @@ pub struct TorTransportConfig {
     pub padding_buckets: Vec<usize>,
     /// Spool-drain retry policy.
     pub retry: RetryPolicy,
+    /// Optional wall-clock budget for a SINGLE [`crate::TorOnionTransport::drain_spool`]
+    /// pass. `None` (default) = unbounded: the pass processes every spooled
+    /// report. `Some(d)` = the drain stops *starting* new reports once the pass
+    /// has run for `d`, leaving the remainder spooled for the next pass. This
+    /// bounds a pass against an unreachable onion (where each report can burn the
+    /// full retry+timeout budget) so a large spool cannot turn one pass into a
+    /// multi-hour run. The in-flight report always completes; the budget gates
+    /// only whether the NEXT one starts.
+    pub max_pass_duration: Option<Duration>,
 }
 
 impl TorTransportConfig {
@@ -154,6 +163,7 @@ impl TorTransportConfig {
             jitter: JitterBounds::default(),
             padding_buckets: DEFAULT_PADDING_BUCKETS.to_vec(),
             retry: RetryPolicy::default(),
+            max_pass_duration: None,
         }
     }
 
@@ -196,6 +206,15 @@ impl TorTransportConfig {
     #[must_use]
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Set a wall-clock budget for a single drain pass (see
+    /// [`max_pass_duration`](Self::max_pass_duration)). `None` restores the
+    /// unbounded default.
+    #[must_use]
+    pub fn with_max_pass_duration(mut self, budget: Option<Duration>) -> Self {
+        self.max_pass_duration = budget;
         self
     }
 

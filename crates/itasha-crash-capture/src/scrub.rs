@@ -330,8 +330,8 @@ fn coarsen_module_name_to_basename(buf: &mut [u8], name_rva: usize) {
         return;
     };
     let byte_len = byte_len as usize;
-    // Number of UTF-16 code units.
-    if byte_len == 0 || byte_len % 2 != 0 {
+    // Number of UTF-16 code units (byte length must be a non-zero even number).
+    if byte_len == 0 || !byte_len.is_multiple_of(2) {
         return;
     }
     let units = byte_len / 2;
@@ -363,7 +363,17 @@ fn coarsen_module_name_to_basename(buf: &mut [u8], name_rva: usize) {
     };
     let base_start_unit = sep_idx + 1;
     if base_start_unit >= units {
-        return; // trailing separator; leave as-is.
+        // Trailing separator with no basename after it (e.g. `C:\Users\jane\`).
+        // There is nothing safe to keep, and leaving it as-is would retain the
+        // full path prefix INCLUDING a username. Zero-fill the whole string so no
+        // path-prefix bytes survive — the same guarantee the basename shift below
+        // provides for the normal case. (Defense-in-depth: real PE/ELF module
+        // names are always basenames, so this branch is not expected at runtime.)
+        for k in 0..units {
+            buf[data_start + k * 2] = 0;
+            buf[data_start + k * 2 + 1] = 0;
+        }
+        return;
     }
     let base_units = units - base_start_unit;
     // Shift the basename code units to the front (byte-wise, 2 bytes per unit).
@@ -872,18 +882,23 @@ mod tests {
         assert_eq!(decode_utf16_lenprefixed(&dump, name_rva), "app.dll");
     }
 
-    /// A module name ENDING in a path separator (`base_start_unit >= units`) is
-    /// left as-is (scrub.rs 342 trailing-separator guard).
+    /// A module name ENDING in a path separator (`base_start_unit >= units`) has
+    /// no basename to keep, so it is ZERO-FILLED rather than left intact — leaving
+    /// it would retain the path prefix including the `jane` username.
     #[test]
-    fn module_name_with_trailing_separator_is_left_as_is() {
+    fn module_name_with_trailing_separator_is_zero_filled() {
         let name_bytes = encode_utf16_lenprefixed("C:\\Users\\jane\\"); // trailing '\\'
         let (mut dump, name_rva) = dump_with_module_name(name_bytes);
         scrub_minidump_in_place(&mut dump).unwrap();
-        // Unchanged: the trailing-separator case does not shift.
-        assert_eq!(
-            decode_utf16_lenprefixed(&dump, name_rva),
-            "C:\\Users\\jane\\"
+        // No basename remains and NO path-prefix byte survives: the decoded name
+        // is all-NUL and none of the path/username tokens are present anywhere.
+        let decoded = decode_utf16_lenprefixed(&dump, name_rva);
+        assert!(
+            decoded.chars().all(|c| c == '\0'),
+            "expected an all-zero module name, got {decoded:?}"
         );
+        assert!(!contains_utf16(&dump, "jane"));
+        assert!(!contains_utf16(&dump, "Users"));
     }
 
     /// A forward-slash separated path coarsens to its basename too (the `/` arm
