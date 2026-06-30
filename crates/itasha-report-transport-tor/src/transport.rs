@@ -30,8 +30,9 @@ use itasha_report_core::envelope::Envelope;
 use itasha_report_core::report::Report;
 use itasha_report_core::spool::Spool;
 
+use crate::arti_connector::ArtiConnector;
 use crate::config::TorTransportConfig;
-use crate::connector::{ArtiConnector, OnionConnector};
+use crate::connector::OnionConnector;
 use crate::http::{post_envelope, HttpOutcome};
 use crate::hygiene::{pad_envelope_bytes, sample_jitter};
 

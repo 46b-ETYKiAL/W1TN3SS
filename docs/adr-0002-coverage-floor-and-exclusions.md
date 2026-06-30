@@ -31,9 +31,13 @@ gate) runs:
 
 ```bash
 cargo llvm-cov nextest --all-features --workspace --locked \
-  --ignore-filename-regex '(crash-capture[\\/]src[\\/](client|bin[\\/]monitor)\.rs|transport-tor[\\/]src[\\/]transport\.rs)' \
+  --ignore-filename-regex '(crash-capture[\\/]src[\\/](client|bin[\\/]monitor)\.rs|transport-tor[\\/]src[\\/]arti_connector\.rs)' \
   --fail-under-lines 95
 ```
+
+> **Amended (OnionConnector seam).** The `transport.rs` exclusion was **removed**
+> and replaced by `arti_connector.rs` — see the *Amendment* section at the end of
+> this ADR. The command above shows the current regex.
 
 A workspace line coverage below **95%** (measured **with** the exclusions
 below) **fails the build**. At adoption the workspace measures **96.96%** lines
@@ -51,7 +55,7 @@ testable logic in each crate stays in the measured surface.
 |---|---|
 | `crates/itasha-crash-capture/src/client.rs` | Arms the **native out-of-process crash handler** and connects to the monitor over `minidumper` IPC. `arm_capture` / `spawn_monitor` / `connect_with_retry` require a real per-OS fault handler + a spawned monitor child process + a live IPC socket. The covered, hermetic surface (config builder, error-`Display`, the type-level Tier-2-token requirement) is duplicated into measured tests; the live arm is not reachable in-process. |
 | `crates/itasha-crash-capture/src/bin/monitor.rs` | The **monitor binary entry point** (`main`). A binary `main` that blocks on an IPC server cannot be exercised by a library test. The monitor's testable logic lives in `monitor.rs` (the lib module, which **is** measured at 96.7%). |
-| `crates/itasha-report-transport-tor/src/transport.rs` | The **live Tor onion bootstrap + connect**. `tor_client` / `transmit` / `build_arti_config` / the live half of `drain_spool` need an embedded Arti `TorClient` to bootstrap the directory consensus and connect to a real `.onion` — impossible offline. The transport's offline logic (spool, fixed-bucket padding, jitter sampling, drain bookkeeping, payload build) is covered by measured tests; the live round-trip is proven out-of-band by the `#[ignore]`d `live_onion_e2e` test. |
+| `crates/itasha-report-transport-tor/src/arti_connector.rs` | The **live Tor onion bootstrap + connect**, now isolated in its own adapter file (see *Amendment*). `ArtiConnector::tor_client` / `connect` / `build_arti_config` need an embedded Arti `TorClient` to bootstrap the directory consensus and connect to a real `.onion` — impossible offline. Everything else — the connector seam, the drain orchestration (retry/backoff, sent/retain/drop accounting), fixed-bucket padding, payload build — is now **measured** in `connector.rs` + `transport.rs`; the live round-trip is proven out-of-band by the `#[ignore]`d `live_onion_e2e` test. |
 
 ### 3. NOT excluded — and why
 
@@ -107,3 +111,45 @@ fixed by extracting `map_launch_error`, and (d) a flaky `transport_reason`
 status-code test whose one-shot server under-drained the request and surfaced a
 transport error instead of a clean `StatusCode(500)`, fixed by fully draining
 the request before replying.
+
+## Amendment — the `transport.rs` exclusion is retired (OnionConnector seam)
+
+This is the **removal trigger** from the *Consequences* section being exercised:
+"Drop an exclusion when its surface becomes testable — e.g. if a mock-Arti seam
+is introduced for `transport.rs`."
+
+`itasha-report-transport-tor` was refactored to a ports-and-adapters seam. The
+live Tor dependency — the only structurally-uncoverable code — was extracted
+behind an `OnionConnector` trait:
+
+- **`connector.rs`** (the *port*) holds the `OnionConnector` trait, the
+  `OnionStream` / `BoxedOnionStream` / `ConnectFuture` currency, and the
+  `non_identifying` error helper. All pure, in-process-testable, **measured**.
+- **`arti_connector.rs`** (the *adapter*) holds `ArtiConnector` — the embedded
+  Arti bootstrap + onion `connect`. This is the **only** un-mockable surface and
+  is now the single excluded file.
+- **`transport.rs`** holds the orchestration: `TorOnionTransport` now stores an
+  `Arc<dyn OnionConnector>` (production `new()` wires `ArtiConnector`; a new
+  `with_connector()` injects a test connector). The `drain_spool` retry/backoff
+  loop, the sent/retain/drop accounting, and padded-envelope-on-the-wire are now
+  **measured** by offline tests that inject a `ScriptedConnector` over
+  `tokio::io::duplex`.
+
+The exclusion regex changed from `…/transport\.rs` to `…/arti_connector\.rs`.
+The excluded surface shrank from all of `transport.rs` (~390 lines) to
+`arti_connector.rs` (~50 lines) — a strict honesty gain: the transport
+orchestration that was previously hidden behind the exclusion is now gated.
+
+Re-measured line coverage (`--all-features`, new exclusion):
+
+| Crate | Without exclusions | With exclusions |
+|---|---|---|
+| `itasha-report-core` | unchanged | unchanged |
+| `itasha-crash-capture` | unchanged | unchanged (excl. `client.rs`, `bin/monitor.rs`) |
+| `itasha-report-transport-tor` | — | `connector.rs` 100%, `transport.rs` 93.2% measured (excl. `arti_connector.rs`) |
+| **workspace** | — | **96.82%** lines / 96.55% regions |
+
+The floor stays at **95** — the new measured total (96.82%) preserves the same
+~1.8-point margin against instrumentation jitter, and the win here is a smaller,
+more honest excluded surface rather than a higher number. As before, removing an
+exclusion only ever *raises* the measured surface; the floor is never lowered.

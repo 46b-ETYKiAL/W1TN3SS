@@ -110,7 +110,7 @@ jobs:
         run: |
           cargo llvm-cov nextest \
             --all-features --workspace --locked \
-            --ignore-filename-regex '(crash-capture[\\/]src[\\/](client|bin[\\/]monitor)\.rs|transport-tor[\\/]src[\\/]transport\.rs)' \
+            --ignore-filename-regex '(crash-capture[\\/]src[\\/](client|bin[\\/]monitor)\.rs|transport-tor[\\/]src[\\/]arti_connector\.rs)' \
             --fail-under-lines 95
 
   # ---------------------------------------------------------------------------
