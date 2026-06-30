@@ -1,7 +1,7 @@
 # W1TN3SS Host-App Integration Guide
 
-- **Version:** 1.0.0
-- **Updated:** 2026-06-18
+- **Version:** 1.1.0
+- **Updated:** 2026-06-30
 - **Audience:** maintainers of an Itasha fleet app (SCR1B3 / C0PL4ND / ST3N0 /
   V14 / F0RG3 / TR4C3) wiring opt-in reporting via the W1TN3SS SDK.
 
@@ -74,30 +74,37 @@ The host glue is four seams:
    `ConsentToken::granted()`. Present **equal-weight** Send / Don't-send choices
    (no dark-pattern asymmetry, no pre-selected default) and an optional
    "Always / Never / Ask" memory that defaults to "Ask".
-4. **Send** — pass the spooled report and the token to `IngestBackend::send`. Log
-   a **counts-only, no-PII** outcome (`Spooled` / `Sent` / `RefusedNoConsent` /
-   `RefusedNoEndpoint` / transport failure) to the app's action log — never a
-   silent drop, never a fake success.
+4. **Send** — pass the spooled report and the token to `IngestBackend::send`. The
+   call returns `Ok(SendOutcome::Sent)` or `Ok(SendOutcome::Failed(reason))`, or an
+   `Err(SendError)` (`PayloadTooLarge` / `Transport`). Map these — together with the
+   host's own pre-send states (consent refused before a token is minted, nothing
+   spooled) — to a **counts-only, no-PII** entry in the app's action log. Never a
+   silent drop, never a fake success. De-spool a report only after `Sent`; a
+   `Failed`/`Err` report stays spooled for a later attempt.
 
 ```rust
 // Sketch — the host glue at the consent dialog's "Send" handler.
-let report = spool.take_next()?;                 // captured + sanitized earlier
-let editable = Preview::of(&report);             // literal Tier-1 text, shown to the user
+let pending = spool.list()?;                     // paths of reports captured + sanitized earlier
+let Some(path) = pending.first() else { return Ok(()); };
+let report = spool.load(path)?;                  // load the spooled Report
+let editable = Preview::of(&report);             // literal Tier-1 text (editable.text()), shown to the user
 // … user reviews / redacts `editable`, then clicks Send …
 let token = ConsentToken::granted();             // exists ONLY after explicit agreement
 match backend.send(&report, &token) {            // &ConsentToken is required at the type level
-    Ok(outcome) => log_outcome(outcome),         // counts/enums only, never PII
-    Err(e)      => log_transport_failure(e),     // structured, never a silent drop
+    Ok(SendOutcome::Sent)        => { spool.remove(path)?; log_sent(); }   // de-spool only on accept
+    Ok(SendOutcome::Failed(why)) => log_failed(&why),  // structured reason; report stays spooled
+    Err(e)                       => log_send_error(e), // PayloadTooLarge / Transport — never a silent drop
 }
 ```
 
 ### Endpoint configuration
 
-There is **no hardcoded endpoint** in the SDK. Inject the self-hosted ingest URL
-through the host's own config/env seam. A build with no endpoint configured can
-spool locally but can **never** transmit (a mis-build cannot phone home); a
-consented send with no endpoint stays spooled and returns a structured
-`no-endpoint` outcome.
+There is **no hardcoded endpoint** in the SDK. `TransportConfig::new(endpoint)`
+requires the self-hosted ingest URL, injected through the host's own config/env
+seam — there is no default and no constructor without it. A build with no endpoint
+configured therefore never constructs a backend at all: captured reports stay in
+the local `Spool` and the host simply never calls `send`, so a mis-build cannot
+phone home. Reports drain only once an endpoint is supplied.
 
 ---
 
@@ -167,7 +174,45 @@ fleet app that has not yet wired reporting must **not** pre-emptively reframe it
 
 ---
 
-## 8. References
+## 8. Opt-in anonymous transport over Tor (`itasha-report-transport-tor`)
+
+The lean `ureq` backend above POSTs directly to the self-hosted endpoint, so the
+ingest server sees the client IP. For the **opt-in anonymous** posture, depend on
+the separate `itasha-report-transport-tor` crate: `TorOnionTransport` is an
+`IngestBackend` that POSTs the same Sentry envelope over an embedded Arti
+(pure-Rust Tor) v3 onion, so the server never learns the client IP. It lives in
+its own crate so the Arti dependency tree never touches the base crate.
+**MSRV note:** this crate requires rustc **1.89** (Arti), higher than the base
+crate's floor.
+
+```rust
+use itasha_report_transport_tor::{TorOnionTransport, TorTransportConfig};
+
+let config = TorTransportConfig::new(onion_host, 80, state_dir, cache_dir);
+let transport = TorOnionTransport::new(config, config_dir)?;   // wires the live ArtiConnector
+// … capture + consent exactly as in §3; then drain in the background:
+let report = transport.drain_spool().await?;                   // DrainReport: sent / retained counts
+```
+
+- **Privacy defaults** (all override-able via `TorTransportConfig::with_*`):
+  send-time jitter in `[0, 60s]` (decouples crash-time from send-time),
+  fixed-bucket body padding (hides true report size), a 120s per-attempt timeout,
+  and an 8 MiB max payload. The onion address is **config-injected** — there is no
+  default endpoint.
+- **Background drain.** `drain_spool()` drains the local spool with capped,
+  backed-off retry (`RetryPolicy` default: 5 attempts, 2s base, 300s cap). A
+  transient failure (connect error / 5xx) is retried; a 4xx is retained without
+  retry. `with_max_pass_duration(Some(d))` bounds a single pass's wall-clock
+  against an unreachable onion — the in-flight report always completes; the budget
+  only gates whether the **next** one starts (default `None` = unbounded).
+- **DI seam.** The live-Tor dial sits behind the `OnionConnector` trait:
+  `new()` wires the production `ArtiConnector`; `with_connector()` injects a test
+  connector so the drain orchestration is exercised offline. See
+  [ADR-0002](adr-0002-coverage-floor-and-exclusions.md).
+
+---
+
+## 9. References
 
 - [privacy-policy.md](privacy-policy.md) · [what-we-collect.md](what-we-collect.md)
 - [ADR-0001](adr-0001-report-core-ingest-boundary.md) — `IngestBackend` boundary,

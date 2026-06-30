@@ -16,6 +16,10 @@ never always-on.
   marketed as "anonymous."
 - **Previewable + redactable.** You see and can edit the literal report payload
   before it is ever sent.
+- **End-to-end encrypted to a developer key.** The scrubbed, previewed payload is
+  sealed (`age` X25519, multi-recipient) **after** the client scrub and preview,
+  **before** transmission. The ingest operator stores only ciphertext; only the
+  developer private key — which never ships in any client crate — can decrypt it.
 - **Self-hosted, no SaaS.** The client speaks the Sentry minidump-envelope wire
   behind an `IngestBackend` boundary — point it at the in-house pipeline now, a
   self-hosted Sentry later, with no client change.
@@ -26,7 +30,7 @@ never always-on.
 
 | Crate | What |
 |---|---|
-| [`itasha-report-core`](crates/itasha-report-core) | Safe SDK spine: two-stream config, sanitizer, local spool, hardened transport, `IngestBackend` + Sentry-envelope wire, previewable payload, GitHub-issue / clipboard / mailto intake helpers. `send` requires a non-forgeable `ConsentToken`. |
+| [`itasha-report-core`](crates/itasha-report-core) | Safe SDK spine: two-stream config, sanitizer, local spool, hardened transport, `IngestBackend` + Sentry-envelope wire, previewable payload, `age` X25519 end-to-end encryption to a developer key, GitHub-issue / clipboard / mailto intake helpers. `send` requires a non-forgeable `ConsentToken`. |
 | [`itasha-crash-capture`](crates/itasha-crash-capture) | Unsafe-isolated native minidump capture (Tier-2), out-of-process. Spooled locally, never auto-sent; gated on heightened consent. |
 | [`itasha-report-transport-tor`](crates/itasha-report-transport-tor) | **Opt-in** anonymous transport: an `IngestBackend` that POSTs the envelope over an embedded Arti (pure-Rust Tor) v3 onion, so the server never learns the client IP. Fixed-minimal headers, fixed-bucket body padding, send-time jitter; fire-and-forget spool drain with capped backed-off retry. Behind the live-Tor `OnionConnector` seam. Separate crate so the Arti tree never touches the base crate. |
 | [`itasha-report-aggregate`](crates/itasha-report-aggregate) | **Opt-in Tier-A**: the only stream that is honestly *anonymous*. Submits a k-anonymous [STAR](https://arxiv.org/abs/2109.10074) message over a low-dimensional crash-signature + coarse quasi-tuple — the operator learns a signature only once ≥ k (default 25) distinct clients report it, with no per-user identifier. Its own consent (`AggregateMode`, default-OFF), separate from Tier-B. Separate crate so the STAR crypto tree never touches the base crate. |
@@ -43,7 +47,7 @@ default-OFF and separately consented; opting into one never opts into the other.
 
 ```toml
 [dependencies]
-itasha-report-core = { git = "https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-W1TN3SS", tag = "itasha-report-core-v0.1.0" }
+itasha-report-core = { git = "https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-W1TN3SS", tag = "itasha-report-core-v0.2.0" }
 ```
 
 Apache-2.0. The self-hosted server is private (`Itasha.Corp_S4F3-W1TN3SS-S3RV3R`).

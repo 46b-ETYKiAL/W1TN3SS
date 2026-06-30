@@ -28,6 +28,8 @@ own** — the host application calls its APIs only after the user consents.
 | `config` | Two-stream `ReportingMode` model (serde, default `Off`). |
 | `report` | The in-memory `Report` model (Tier-1 text + opaque Tier-2 attachments). |
 | `sanitize` | The privacy core — home/username/host/env scrubbing + size caps. |
+| `redact` | Fail-closed path anchoring + hardened, regex-free free-text redaction (anonymity hardening). |
+| `quasi` | Quasi-identifier coarsening + the fail-closed allowlist envelope filter (anonymity hardening). |
 | `spool` | Local-first atomic file-per-report spool with count + byte budgets. |
 | `e2e` | **E2E-encrypt** the scrubbed payload to a developer public key (`age` X25519, multi-recipient) — the operator stores ciphertext only. |
 | `envelope` | Sentry envelope wire serialization (round-trip); `Envelope::sealed` rides the E2E ciphertext as an opaque attachment. |
@@ -164,6 +166,7 @@ is **no vendor LLM / telemetry / SaaS SDK** (AES Clause 5).
 | Dependency | Purpose | Service implied |
 |---|---|---|
 | `serde` / `serde_json` | Config + envelope (de)serialization | none |
+| `rand` (pinned `=0.8.6`) | OS CSPRNG behind the ephemeral, **unlinkable** per-report nonce | none (local entropy) |
 | `ureq` (rustls, pure-Rust) | The single hardened HTTP transport | a self-hosted endpoint the **host** configures |
 | `age` (X25519, pure-safe-Rust, `default-features = false`) | E2E-encrypt the scrubbed payload to a developer public key | none (local crypto; the developer private key is out-of-band) |
 | `webbrowser` | Launch the user's browser for the GitHub Issue-Form | none (hands off to the user's browser) |

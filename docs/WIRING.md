@@ -3,6 +3,12 @@
 This crate exposes host-facing seams the W1TN3SS apps call. The integration
 point that must always have a live call-site is `IngestBackend::send`.
 
+> Scope: this contract covers `itasha-report-core` only. The opt-in
+> `itasha-report-transport-tor` crate adds its own seams — the `OnionConnector`
+> trait DI port, the `RetryPolicy`/`transmit_with_retry` drain loop, and the
+> `ArtiConnector` adapter — documented in
+> [ADR-0002](adr-0002-coverage-floor-and-exclusions.md).
+
 ```yaml
 wiring:
   runtime_surface: live
