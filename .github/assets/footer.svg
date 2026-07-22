@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 214" width="1280" height="214" role="img" aria-label="W1TN3SS footer — Itasha Corp">
+  <defs>
+    <pattern id="fscan" patternUnits="userSpaceOnUse" width="1280" height="4">
+      <rect width="1280" height="2" fill="transparent"/><rect y="2" width="1280" height="2" fill="rgba(0,0,0,0.16)"/>
+    </pattern>
+    <radialGradient id="fvig" cx="50%" cy="50%" r="75%">
+      <stop offset="0%" stop-color="transparent"/><stop offset="100%" stop-color="rgba(0,0,0,0.5)"/>
+    </radialGradient>
+    <linearGradient id="wire" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#b4ee3a" stop-opacity="0"/><stop offset="50%" stop-color="#b4ee3a" stop-opacity="0.9"/><stop offset="100%" stop-color="#b4ee3a" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="fphos"><feGaussianBlur in="SourceGraphic" stdDeviation="0.7" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <filter id="fglow"><feGaussianBlur stdDeviation="2.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <filter id="fsigilGlow" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur in="SourceGraphic" stdDeviation="0.8" result="b"><animate attributeName="stdDeviation" values="0.5;1.6;0.5" dur="3.6s" repeatCount="indefinite"/></feGaussianBlur><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <style>
+    text { font-family: 'JetBrains Mono','SF Mono','Fira Code','Cascadia Code',Consolas,monospace; }
+    @keyframes fheart { 0%,100% { transform: scale(1); opacity: 0.55; } 15% { transform: scale(1.3); opacity: 0.95; } 30% { transform: scale(1); opacity: 0.55; } }
+    @keyframes wireTravel { 0% { transform: translateX(-220px); } 100% { transform: translateX(1280px); } }
+    @keyframes fflicker { 0%,96%,100% { opacity: 1; } 97% { opacity: 0.96; } 98% { opacity: 0.99; } }
+    @keyframes nodeOn { 0%,100% { opacity: 0.3; } 50% { opacity: 0.9; } }
+    @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+  </style>
+
+  <rect x="0" y="0" width="1280" height="214" rx="12" fill="#0b0f12"/>
+  <rect x="2" y="2" width="1276" height="210" rx="11" fill="#1a242b" stroke="#2a3a42" stroke-width="1"/>
+  <rect x="24" y="20" width="1232" height="174" rx="5" fill="#070a0c"/>
+  <rect x="24" y="20" width="1232" height="174" rx="5" fill="url(#fscan)"/>
+  <rect x="24" y="20" width="1232" height="174" rx="5" fill="url(#fvig)"/>
+  <rect x="24" y="20" width="1232" height="174" rx="5" fill="none" stroke="#1a242b"/>
+
+  <g stroke="#b4ee3a" stroke-width="1.2" fill="none" opacity="0.55">
+    <path d="M48 44 h22 M48 44 v22"/><path d="M1232 44 h-22 M1232 44 v22"/>
+    <path d="M48 170 h22 M48 170 v-22"/><path d="M1232 170 h-22 M1232 170 v-22"/>
+  </g>
+
+  <!-- compact daemon-sigil echo (left) — assembled resting frame, slow spin -->
+  <g transform="translate(150,107)" opacity="0.5" filter="url(#fsigilGlow)">
+    <g stroke="#b4ee3a" fill="none">
+      <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="60s" repeatCount="indefinite"/>
+      <circle r="30" stroke-width="0.6" opacity="0.7"/>
+      <circle r="27.5" stroke-width="0.4" opacity="0.5"/>
+      <g stroke-width="0.5" opacity="0.6">
+        <line x1="0" y1="-30" x2="0" y2="-27.5"/><line x1="26" y1="-15" x2="23.8" y2="-13.7"/>
+        <line x1="26" y1="15" x2="23.8" y2="13.7"/><line x1="0" y1="30" x2="0" y2="27.5"/>
+        <line x1="-26" y1="15" x2="-23.8" y2="13.7"/><line x1="-26" y1="-15" x2="-23.8" y2="-13.7"/>
+      </g>
+    </g>
+    <g stroke="#b4ee3a" stroke-width="0.9" fill="none" stroke-linecap="round" transform="scale(0.55)">
+      <path d="M0 -16 L-5 -3 L2 -1 L-3 9 L2 16 M-15 -9 L-8 -5 M15 -9 L8 -5 M-15 9 L-8 5 M15 9 L8 5 M-7 13 A7 7 0 0 0 7 13" pathLength="200" stroke-dasharray="200" stroke-dashoffset="0">
+        <animate attributeName="stroke-dashoffset" from="200" to="0" dur="2.4s" fill="freeze" calcMode="spline" keySplines="0.6 0 0.2 1"/>
+      </path>
+    </g>
+  </g>
+
+  <g style="animation: fflicker 7s infinite;">
+    <line x1="240" y1="107" x2="1160" y2="107" stroke="#1f2b32" stroke-width="1"/>
+    <g fill="#b4ee3a">
+      <circle cx="470" cy="107" r="2.2" style="animation: nodeOn 3s ease-in-out 0.5s infinite;"/>
+      <circle cx="810" cy="107" r="2.2" style="animation: nodeOn 3s ease-in-out 1s infinite;"/>
+      <circle cx="1020" cy="107" r="2.2" style="animation: nodeOn 3s ease-in-out 1.5s infinite;"/>
+    </g>
+    <g style="animation: wireTravel 5s linear infinite;">
+      <rect x="0" y="106" width="220" height="2" fill="url(#wire)"/>
+    </g>
+
+    <text x="700" y="92" text-anchor="middle" font-size="22" font-weight="bold" letter-spacing="8" fill="#e9f7ff" filter="url(#fglow)">W1TN3SS</text>
+    <text x="700" y="132" text-anchor="middle" font-size="11" letter-spacing="4" fill="#b4ee3a" filter="url(#fphos)">crash reporting · opt-in · sealed</text>
+  </g>
+
+  <g>
+    <circle cx="52" cy="200" r="3.2" fill="#6fb89a" opacity="0.7" style="animation: fheart 2.4s ease-in-out infinite; transform-origin: 52px 200px;"/>
+    <circle cx="66" cy="200" r="2.6" fill="#b4ee3a" opacity="0.45"/>
+    <circle cx="80" cy="200" r="2.6" fill="#cdf47a" opacity="0.3"/>
+    <text x="100" y="200" font-size="8.5" fill="#3a4a52" letter-spacing="3" dominant-baseline="central">ITASHA.CORP</text>
+    <text x="640" y="200" text-anchor="middle" font-size="8.5" fill="#2c3a42" letter-spacing="2.4" dominant-baseline="central">WITNESS-CORE · present day · present time</text>
+    <text x="1232" y="200" font-size="8.5" fill="#3a4a52" letter-spacing="2.4" dominant-baseline="central" text-anchor="end">CRT-IC v5</text>
+    <circle cx="1248" cy="200" r="3.4" fill="#6fb89a" opacity="0.5"/>
+    <circle cx="1248" cy="200" r="1.8" fill="#6fb89a" opacity="0.95" style="animation: fheart 2.4s ease-in-out infinite; transform-origin: 1248px 200px;"/>
+  </g>
+</svg>

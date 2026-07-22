@@ -1,0 +1,29 @@
+<!-- Itasha Corp app icon (small) — 512×512 — CRT-IC v5 squint-test variant -->
+<!-- Stripped for 16/24/32/48px: void plate + accent keyline + single ring + 4 -->
+<!-- bold seal-ticks (the "hint of seal") + the bold M0 -16 L-5 -3 L2 -1 L-3 9 L2 16 M-15 -9 L-8 -5 M15 -9 L8 -5 M-15 9 L-8 5 M15 9 L8 5 M-7 13 A7 7 0 0 0 7 13 core glyph. -->
+<!-- No kanji band / kamea / fine tracery (would alias at small sizes). Same -->
+<!-- core geometry as the master so the glyph never shifts across tiers. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="W1TN3SS app icon (small)">
+  <title>W1TN3SS app icon — small-size variant (&lt;=48px)</title>
+  <rect x="40" y="40" width="432" height="432" rx="88" fill="#070a0c"/>
+  <rect x="40" y="40" width="432" height="432" rx="88" fill="none" stroke="#b4ee3a" stroke-width="10"/>
+  <!-- single ring + 4 bold seal-ticks -->
+  <g stroke="#b4ee3a" fill="none">
+    <circle cx="256" cy="256" r="150" stroke-width="6" opacity="0.85"/>
+    <g stroke-width="9" stroke-linecap="round" opacity="0.85">
+      <line x1="256" y1="92" x2="256" y2="116"/>
+      <line x1="420" y1="256" x2="396" y2="256"/>
+      <line x1="256" y1="420" x2="256" y2="396"/>
+      <line x1="92" y1="256" x2="116" y2="256"/>
+    </g>
+  </g>
+  <!-- bold M0 -16 L-5 -3 L2 -1 L-3 9 L2 16 M-15 -9 L-8 -5 M15 -9 L8 -5 M-15 9 L-8 5 M15 9 L8 5 M-7 13 A7 7 0 0 0 7 13 core glyph (centred, scaled to fill the ring). -->
+  <!-- scale 4.4 → glyph spans ~±80px; stroke 3 × 4.4 ≈ 13px effective: a -->
+  <!-- bold line-figure, NOT a filled blob. -->
+  <g transform="translate(256,256)">
+    <g stroke="#b4ee3a" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round" transform="scale(4.4)">
+      <path d="M0 -16 L-5 -3 L2 -1 L-3 9 L2 16 M-15 -9 L-8 -5 M15 -9 L8 -5 M-15 9 L-8 5 M15 9 L8 5 M-7 13 A7 7 0 0 0 7 13"/>
+    </g>
+  </g>
+  <style>@media (prefers-reduced-motion: reduce) { * { animation: none !important; } }</style>
+</svg>
